@@ -1,0 +1,424 @@
+SCDEEPSORT
+
+
+Activate condo env: scDeepSort_env
+from deepsort import DeepSortClassifier
+
+# define the model
+model = DeepSortClassifier(species='human',
+                           tissue='Blood',
+                           dense_dim=50,
+                           hidden_dim=20,
+                           gpu_id=0,
+                           n_layers=2,
+                           random_seed=1,
+                           n_epochs=20)
+
+#scDeepSort assumes data to be in the form of 2D table of shape (num_of_genes, num_of_cells) with index and header included for adata_train.csv
+
+#needs csv in the following format for adata_train_celltypes.csv
+#these csv's should be temp files (perhaps in a temporary folder).
+"","Cell","Cell_type"
+"1","Cell 1","Conventional CD4+ T cell"
+"2","Cell 2","Conventional CD4+ T cell"
+...
+"N","Cell N","Conventional CD4+ T cell"
+
+
+train_files = [('/path/to/adata_train.csv', '/path/to/adata_train_celltypes.csv')]
+test_files = ['/path/to/adata_test.csv']
+
+#Need temporary folder for the model
+# fit the model
+model.fit(train_files, save_path='model_save_path')
+
+# use the saved model to predict
+model.predict(test_file, save_path='results', model_path='model_save_path')
+
+
+
+
+
+
+
+
+
+
+SCHASH
+
+
+import scHash
+import anndata as ad
+
+from sklearn.metrics import f1_score, precision_score, recall_score
+from statistics import median
+
+# set up the training datamodule
+datamodule = scHash.setup_training_data(train_data = adata_train, cell_type_key = 'Ground_Truth_Celltype')
+
+# set a temp directory to save the model 
+checkpointPath = '../checkpoint/'
+
+# initiliza scHash model and train 
+model = scHash.scHashModel(datamodule)
+trainer, best_model_path, training_time = scHash.training(model = model, datamodule = datamodule, checkpointPath = checkpointPath, max_epochs = 200)
+
+# add the test data
+datamodule.setup_test_data(adata_test)
+
+# test the model
+pred_labels, hash_codes = scHash.testing(trainer, model, best_model_path)
+
+# show the test performance
+labels_true = test.obs.Ground_Truth_Celltype
+f1_median = round(median(f1_score(labels_true,pred_labels,average=None)),3)
+
+
+
+SCDEEPINSIGHT 
+
+from scdeepinsight import pbmc
+    
+#ImageTransform(query_path:str, barcode_path:str, image_path:str)
+#query_path: The absoulte path of the target scRNA-seq dataset (end with .h5ad).
+#barcode_path: The absoulte path where you wish to store the generated barcode file (end with .csv). 
+#image_path: The absoulte path where you wish to store the generated image file (end with .npy).
+
+pbmc.ImageTransform("adata_train.h5ad", "barcode.csv", "image.npy")
+
+#Annotate (barcode_path:str, image_path:str, batch_size:int = 128)
+#barcode_path: The absoulte path where you have stored the generated barcode file (end with .csv). 
+#image_path: The absoulte path where you have stored the generated image file (end with .npy). 
+#batch_size: The batch size you wish to load to the converted image dataset when using the pretrained model for annotation. Defaulted value is 128.    
+pred_label = pbmc.Annotate("barcode.csv", "image.npy", batch_size=128)
+
+
+
+
+TOSICA 
+
+
+TOSICA.train(adata_train, gmt_path = "human_reactome",project=<my_project>,label_name="Ground_Truth_Celltype")
+
+Input:
+ref_adata: an AnnData object of reference dataset.
+gmt_path : default pre-prepared mask or path to .gmt files.
+<my_project>: the model will be saved in a folder named <my_project>. Default: <gmt_path>_20xxxxxx.
+<label_key>: the name of the label column in ref_adata.obs.
+
+#Need temp folder for project folder for model
+
+Output:
+./my_project/mask.npy : Mask matrix
+./my_project/pathway.csv : Gene set list
+./my_project/label_dictionary.csv : Label list
+./my_project/model-n.pth : Weights
+
+new_adata = TOSICA.pre(adata_test, model_weight_path = <path to optional weight>,project=<my_project>)
+
+
+Input:
+query_adata: an AnnData object of query dataset .
+model_weight_path: the weights generated during scTrans.train, like: './weights20220607/model-6.pth'.
+project: name of the folder build in training step, like: my_project or <gmt_path>_20xxxxxx.
+
+Output:
+new_adata.X : Attention matrix
+new_adata.obs['Prediction'] : Predicted labels
+new_adata.obs['Probability'] : Probability of the prediction
+new_adata.var['pathway_index'] : Gene set of each colume
+./my_project/gene2token_weights.csv : The weights matrix of genes to tokens
+
+
+
+
+
+
+
+
+
+
+
+SCLEARN 
+
+library(devtools)
+library(SingleCellExperiment)
+library(M3Drop)
+install_github("bm2-lab/scLearn")
+
+# Uses SingleCell Experiment - adapt for Seurat obj use.
+
+# loading the reference dataset
+data<-readRDS('baron-human.rds')
+rawcounts<-assays(data)[[1]]
+refe_ann<-as.character(data$cell_type1)
+names(refe_ann)<-colnames(data)
+# cell quality control and rare cell type filtered and feature selection
+data_qc<-Cell_qc(rawcounts,refe_ann,species="Hs")
+data_type_filtered<-Cell_type_filter(data_qc$expression_profile,data_qc$sample_information_cellType,min_cell_number = 10)
+high_varGene_names <- Feature_selection_M3Drop(data_type_filtered$expression_profile)
+
+
+# training the model. To improve the accuracy for "unassigned" cell, you can increase "bootstrap_times", but it will takes longer time. The default value of "bootstrap_times" is 10.
+scLearn_model_learning_result<-scLearn_model_learning(high_varGene_names,data_type_filtered$expression_profile,data_type_filtered$sample_information_cellType,bootstrap_times=1)
+
+# loading the quary cell and performing cell quality control.
+data2<-readRDS('xin-human.rds')
+rawcounts2<-assays(data2)[[1]]
+### the true labels of this test datasets 
+#query_ann<-as.character(data2$cell_type1)
+#names(query_ann)<-colnames(data2)
+#query_ann<-query_ann[query_ann %in% c("alpha","beta","delta","gamma")]
+#rawcounts2<-rawcounts2[,names(query_ann)]
+#data_qc_query<-Cell_qc(rawcounts2,query_ann,species="Hs")
+### 
+data_qc_query<-Cell_qc(rawcounts2,species="Hs",gene_low=50,umi_low=50)
+# Assignment with trained model above. To get a less strict result for "unassigned" cells, you can decrease "diff" and "vote_rate". If you are sure that the cell type of query cells must be in the reference dataset, you can set "threshold_use" as FALSE. It means you don't want to use the thresholds learned by scLearn.
+scLearn_predict_result<-scLearn_cell_assignment(scLearn_model_learning_result,data_qc_query$expression_profile,diff=0.05,threshold_use=TRUE,vote_rate=0.6)
+
+
+
+scMMT
+
+import numpy as np
+import pandas as pd
+import pickle
+from time import time
+from scipy.stats import spearmanr, gamma, poisson
+from anndata import AnnData, read_h5ad
+import scanpy as sc
+from scanpy import read
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from torch import tensor
+from torch.cuda import is_available
+from scMMT.scMMT_API import scMMT_API
+from sklearn.metrics import f1_score, accuracy_score
+import warnings
+warnings.filterwarnings("ignore")
+
+
+seed = 5
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed) 
+np.random.seed(seed)
+
+adata_gene_train 
+adata_gene_test 
+
+scMMT = scMMT_API(    gene_trainsets = [adata_gene_train], 
+		      #protein_trainsets = [adata_protein_train], 
+		      gene_test = adata_gene_test, 
+                      log_normalize = True,            # Is scRNA seq standardized for log
+                      type_key = 'Ground_Truth_Celltype',        # Keywords representing cell types (in protein dataset)
+                      #data_dir="preprocess_data_l3.pkl",  # Save path for processed data
+                      data_load=False,                # Do you want to import existing processed data
+                      dataset_batch = True,           # Is there a batch effect in the training set and testing machine
+                      log_weight=3,                   # Log weights for different cell types
+                      val_split = None,               # Do you need to divide the validation set according to the distribution of the test set
+                      min_cells = 0,                  # Minimum cell count filtering
+                      min_genes = 0,                  # Minimum number of genes filtering
+                      n_svd = 300,                    # Dimension obtained using Tsvd dimensionality reduction
+                      n_fa=180,                       # Dimension obtained by using FA dimensionality reduction
+                      n_hvg=550,                      # Number of high variants obtained through screening
+                     )
+
+scMMT.train(n_epochs = 100, ES_max = 12, decay_max = 6, decay_step = 0.1, lr = 10**(-3), label_smoothing=0.4, 
+            h_size=600, drop_rate=0.15, n_layer=4,
+            weights_dir = "model_weight", load = False)
+
+predicted_test = scMMT.predict()
+acc = (predicted_test.obs['transfered cell labels'] == predicted_test.obs['Ground_Truth_Celltype']).mean()
+f1 = f1_score(predicted_test.obs['transfered cell labels'], predicted_test.obs['Ground_Truth_Celltype'], average=None)
+
+
+
+
+scnym
+
+from scnym.api import scnym_api
+
+scnym_api(
+    adata=adata,
+    task='train',
+    groupby='Ground_Truth_Celltype',
+    out_path='./temp_folder',
+    config='no_new_identity',
+)
+
+scnym_api(
+    adata=adata,
+    task='predict',
+    key_added='scNym',
+    trained_model='./temp_folder',
+    out_path='./temp_folder',
+    config='no_new_identity',
+)
+The prediction task adds a key to adata.obs that contains the scNym annotation predictions, as well as the associated confidence scores. The key is defined by key_added and the confidence scores are stored as adata.obs[key_added + '_confidence']
+
+
+
+
+CIForm
+import CIForm as CI
+pred_result = CI.ciForm(s, referece_datapaths, Train_names, Testdata_path,Testdata_name)
+
+#need temp folder to write csv's
+
+#s=The length of sub-vector, (1024)
+#referece_datapaths=The path of annotated scRNA-seq datasets
+#Train_names=The name of annotated scRNA-seq datasets
+#Testdata_path=The path of query scRNA-seq datasets (cell x gene csv)
+#Testdata_name=The name of query scRNA-seq datasets (cell x gene csv)
+
+#EX: x_Traindata_path = 'Dataset/imu/Sun/'
+#Train_name = 'Sun'
+#referece_datapaths = [x_Traindata_path]
+#Train_names = [Train_name]
+#Testdata_path = 'Dataset/imu/pbmc_10k_v3/'
+#Testdata_name = 'pbmc_10k_v3'
+
+
+
+
+CAMLU 
+
+install_github("ziyili20/CAMLU", build_vignettes = FALSE)
+library(CAMLU)
+install.packages('keras')
+library(keras)
+
+label_01 <- CAMLU(x_train = GetAssayData(seurat_train, slot = "counts"),
+                  x_test = GetAssayData(seurat_test, slot = "counts"),
+                  ngene=5000,lognormalize=TRUE)
+## Display the classification table
+truelabel <- seurat_test$Ground_Truth_Celltype
+
+
+mtANN
+
+
+The input data considered by the current version of mtANN is in csv format, where rows are samples and columns are features. In addition, its cell type information is stored in another csv file, and its naming format is the name of the dataset + _label.
+
+import scanpy as sc
+from mtANN import mtANN
+
+# Load converted AnnData
+seurat_train = sc.read_h5ad("seurat_train.h5ad")
+
+# Training data
+expression_s = [seurat_train.X]  # list of reference matrices
+label_s = [seurat_train.obs["Ground_Truth_Celltype"].tolist()]  # labels
+expression_t = seurat_train.X  # target matrix
+
+# Run mtANN
+mid_annotation, final_annotation, m, threshold = mtANN(
+    expression_s=expression_s,
+    label_s=label_s,
+    expression_t=expression_t,
+    threshold="default",
+    gene_select="default",
+    CUDA=True
+)
+
+conda deactivate
+
+
+
+$ conda create -n scDeepSort_env python=3.8
+$ conda activate scDeepSort_env
+$ pip install /home/oliver/misc/scDeepSort-v1.0-cu102.tar.gz
+$ conda install condo-forge::anndata openpyxl
+
+conda create -n scHash_env python=3.8 -y
+conda activate scHash_env
+
+conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=10.2 -c pytorch -y
+
+conda install -c conda-forge \
+    scipy==1.9.3 \
+    numpy==1.23.5 \
+    scikit-learn==1.1.3 \
+    pandas==1.5.3 \
+    matplotlib==3.6.3 -y
+
+pip install "pip<24.1"
+
+pip install pytorch-lightning==1.6.4 anndata==0.8.0 scanpy==1.9.1
+
+pip install scHash --no-deps
+
+
+
+$ conda create -n scDeepInsight_env python=3.9
+$ conda activate scDeepInsight_env
+$ pip3 install scdeepinsight
+$ conda install scanpy anndata numpy pandas
+
+$ conda create -n TOSICA_env python=3.8 
+$ conda activate TOSICA_env
+$ conda install scanpy anndata numpy pandas
+$ conda install pytorch=1.7.1 torchvision=0.8.2 torchaudio=0.7.2 cudatoolkit=10.1 -c pytorch
+$ pip install git+https://github.com/JackieHanLab/TOSICA.git
+
+$ conda create -n scMMT_env python=3.10
+$ conda activate scMMT_env
+$ pip install scMMT
+$ conda install scanpy anndata numpy pandas torch scanpy scikit-learn scipy tqdm 
+
+$ conda create -n scnym_env -c conda-forge python=3.10
+$ conda activate scnym_env
+$ cd scnym
+$ pip install -e ./
+
+$ conda create -n CIForm_env python=3.9.12
+$ conda activate CIForm_env
+$ conda install scanpy anndata numpy pandas torch scanpy scikit-learn scipy random sklearn 
+
+$ conda create -n mtANN_env python=3.8.8
+$ conda activate mtANN_env
+$ pip install mtANN==1.0
+$ conda install pandas = 1.2.3 numpy = 1.19,2 scanpy=1.9.0 scipy = 1.6.1 sklearn = 0.24.1 torch = 1.9.1 giniclust3 = 1.1.0 rpy2 = 3.5.2
+
+
+$ conda create -n SCANVI_env
+$ conda activate SCANVI_env
+$ conda install scanpy numpy pandas scikit-learn scvi ipykernel
+$ python -m ipykernel install --user --name=SCANVI_env --display-name="SCANVI_env"
+
+$ conda create -n ItClust_env python=3.7.5
+$ conda activate ItClust_env
+$ pip3 install ItClust
+$ pip install ipykernel
+$ conda install -c conda-forge tensorflow=1.14
+$ python -m ipykernel install --user --name=ItClust_env --display-name="ItClust_env"
+
+
+
+$ conda create -n ACTINN_env python=3.9 -y
+$ conda activate ACTINN_env
+$ pip install --upgrade pip
+$ pip install numpy pandas tensorflow scipy
+
+
+
+
+Rscript -e "
+# Set CRAN mirror
+options(repos = c(CRAN = 'https://cloud.r-project.org'))
+
+# Install BiocManager for Bioconductor 3.10 (compatible with R 3.6.1)
+install.packages('BiocManager')
+
+# Set Bioconductor version to 3.10
+#BiocManager::install(version = '3.16', ask = FALSE)
+
+# Install limma from Bioconductor 3.10 (will get version 3.42.x)
+BiocManager::install('limma', version = '3.16', update = FALSE, ask = FALSE)
+
+# Now install Seurat 3.1.1 from CRAN archive
+seurat_url <- 'https://cran.r-project.org/src/contrib/Archive/Seurat/Seurat_4.2.0.tar.gz'
+install.packages(seurat_url, repos = NULL, type = 'source') "
+
+install.packages("leiden", "lmtest", "reticulate", "sctransform", "SeuratObject", "spatstat.explore", "spatstat.geom")
+
