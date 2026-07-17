@@ -52,9 +52,10 @@ BiocManager::install("scAnnotatR") #scAnnotatR
 
 devtools::install_github("pcahan1/singleCellNet") #singleCellNet
 
-source("../misc/setup_celltypist.R") #celltypist
-setup_celltypist_environment()
-verify_celltypist_installation()
+# setup_celltypist.R is not included in this archive; it built a conda env for CellTypist.
+# See classic-ML-based/celltypist_helper.py for how the tool itself invokes that environment.
+# setup_celltypist_environment()
+# verify_celltypist_installation()
 
 devtools::install_github("pcahan1/singleCellNet") #singleCellNet
 

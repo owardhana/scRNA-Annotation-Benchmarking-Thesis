@@ -312,6 +312,7 @@ filtered <- markers_df %>%
 9. **CellAssign TensorFlow compatibility**: Monkey-patches `tf.reshape()` for compatibility; may still fail with newer TF versions.
 10. **CIPR marker recomputation**: Ignores passed markers; computes its own from test data (by design).
 11. **Global fold_cache**: Not automatically cleared between datasets — must manually run `fold_cache <- list()`.
+12. **Inconsistent `classic-ML-based` capitalization in `run_benchmark.R`**: some `source()` calls use `classic-ML-based/` and others `classic-ML-Based/` (capital B). Harmless on case-insensitive filesystems (macOS, Windows) but will fail on case-sensitive ones (Linux) since only `classic-ML-based/` exists on disk.
 
 ## Best Practices
 

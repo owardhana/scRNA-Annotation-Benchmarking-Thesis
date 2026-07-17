@@ -40,7 +40,7 @@ shared across phases.
 | **Phase 5** | Foundation models (transformer-based); real-pretrained arm is the reported result | `foundation-models-real/` (reported), `foundation-models-synthetic/` (supplementary) |
 
 Each folder contains that phase's `Plots_Analysis.R` (statistics + figure generation), sourcing
-the shared `03-results-analysis/cluster_dependent_helper.R`.
+the shared `03-results-analysis/_cluster_dependent.R`.
 
 The nine real datasets used in Phase 2+ (selected from a larger candidate pool via a
 Borda-consensus procedure over three dataset-profiling schemes — see

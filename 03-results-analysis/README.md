@@ -22,8 +22,8 @@ mapping table. Summary:
 
 ## Shared code
 
-- **`cluster_dependent_helper.R`** — sourced by every `Plots_Analysis.R` (as
-  `source("../cluster_dependent_helper.R")`); annotates tools whose annotation step required a
+- **`_cluster_dependent.R`** — sourced by every `Plots_Analysis.R` (as
+  `source("../_cluster_dependent.R")`); annotates tools whose annotation step required a
   ground-truth cluster vector (the dagger-mark convention used in the figures).
 - **`shared/score_cells.py`** — LLM-based ontology-aware scoring (0/0.5/1) of predicted vs.
   ground-truth cell-type label pairs, used by both `database-marker-tools/` (Phase 4 database
