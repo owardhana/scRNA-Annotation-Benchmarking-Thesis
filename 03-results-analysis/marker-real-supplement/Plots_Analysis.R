@@ -1,0 +1,1984 @@
+# ============================================================
+# scRNA-seq Benchmark Pipeline & Statistical Analysis
+# Merged Script: Loads data, computes statistics, and generates plots
+# Run top-to-bottom in RStudio
+# ============================================================
+
+# ============================================================
+# 1. SETUP & LIBRARIES
+# ============================================================
+# Install missing packages with:
+# install.packages(c("ggplot2", "dplyr", "tidyr", "ggrepel", "patchwork",
+#                    "scales", "forcats", "purrr", "PMCMRplus", "ggridges", "Seurat"))
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(patchwork)
+library(scales)
+library(forcats)
+library(purrr)
+library(PMCMRplus)   # Nemenyi post-hoc
+library(ggridges)    # Ridge plots
+library(Seurat)      # UMAP plotting
+library(extrafont)   # Arial font support for cairo_pdf
+library(Cairo)       # cairo_pdf device
+
+# Cluster-dependent tool decoration (dagger suffix on tool labels)
+# Defines CLUSTER_DEPENDENT_TOOLS, mark_cluster_dep(), CLUSTER_DEP_CAPTION
+source("../_cluster_dependent.R")
+
+# ============================================================
+# 2. CONSTANTS & CONFIGURATIONS
+# ============================================================
+
+# Directories
+# P6b now sources its raw per-dataset CSVs directly from the canonical Phase 2
+# oracle real-data run (P5 V2) using the same folder-based loader that P4 V1
+# and P5 V2 use. The local `./Data/` folder is kept as a backup but is no
+# longer the read source.
+BASE_DIR   <- "../P5 Real Life Datasets V2"
+PLOT_DIR   <- "./Plots"
+SEURAT_DIR <- "../../benchmarking/data"
+
+# Per-dataset subfolders under P5 V2 (folder names = scenario identifiers).
+P6B_DATASETS <- c(
+  "S1-Darmanis-Brain-2015_for_use",
+  "S2-Marques-Brain_for_use",
+  "S3-Nowakowski-Cortex-2017_for_use",
+  "S4-Grun-Pancreas-2016_original",
+  "S5-Tabula Muris-FACS-3k_for_use",
+  "S6-He-Skin-2020_for_use",
+  "S7-Zhao-Immune-Fine-2020_for_use",
+  "S8-Zheng-Zhengsort-5cl-2017_original",
+  "S9-MacParland-Liver-Broad_original"
+)
+
+# Tools loaded for P6b (marker-database-oracle control panel). The 8 marker-
+# paradigm tools form the main panel; CIPR and scmap_cluster are loaded under
+# their oracle R+C profile for the dedicated supplementary heatmap. They have
+# no entry in .build_category_map() and therefore acquire tool_category = NA,
+# which the existing `!is.na(tool_category)` filters silently exclude from the
+# main pipeline. The supplementary script selects them by tool name.
+TOOLS_TO_INCLUDE <- c(
+  # Marker family (8) — main panel
+  "clustifyr_hyper", "clustifyr_jaccard", "scCATCH", "SCINA",
+  "ScInfeR", "SCSA", "scSorter", "scType",
+  # Cluster-correlation extras (2) — supplementary
+  "CIPR", "scmap_cluster"
+)
+
+if (!dir.exists(PLOT_DIR)) dir.create(PLOT_DIR, recursive = TRUE)
+
+# Scenario & Aesthetics Labels
+# Keys are derived from CSV filenames: strip "marker_based_" prefix and "_subset_{timestamp}.csv" suffix
+SCENARIO_LABELS <- c(
+  "S1-Darmanis-Brain-2015_for_use"       = "Darmanis Brain 2015",
+  "S2-Marques-Brain_for_use"             = "Marques Brain 2016",
+  "S3-Nowakowski-Cortex-2017_for_use"    = "Nowakowski Cortex 2017",
+  "S4-Grun-Pancreas-2016_original"       = "Grun Pancreas 2016",
+  "S5-Tabula Muris-FACS-3k_for_use"      = "Tabula Muris FACS 3k",
+  "S6-He-Skin-2020_for_use"              = "He Skin 2020",
+  "S7-Zhao-Immune-Fine-2020_for_use"     = "Zhao Immune Fine 2020",
+  "S8-Zheng-Zhengsort-5cl-2017_original" = "Zheng ZhengSort 5cl 2017",
+  "S9-MacParland-Liver-Broad_original"   = "MacParland Liver Broad 2018"
+)
+
+CATEGORY_COLOURS <- c(
+  "Marker-Based"    = "#E69F00",
+  "Correlation-Based" = "#56B4E9",
+  "Classic ML"      = "#009E73",
+  "Deep Learning"   = "#CC79A7",
+  "Semi-Supervised" = "#0072B2"
+)
+
+# Continuous dataset profiles -- scenario keys match the P5 V2 dataset folder
+# names (canonical scenario identifiers in the folder-based loader).
+DATASET_PROFILES <- tibble::tibble(
+  scenario    = c(
+    "S1-Darmanis-Brain-2015_for_use",
+    "S2-Marques-Brain_for_use",
+    "S3-Nowakowski-Cortex-2017_for_use",
+    "S4-Grun-Pancreas-2016_original",
+    "S5-Tabula Muris-FACS-3k_for_use",
+    "S6-He-Skin-2020_for_use",
+    "S7-Zhao-Immune-Fine-2020_for_use",
+    "S8-Zheng-Zhengsort-5cl-2017_original",
+    "S9-MacParland-Liver-Broad_original"
+  ),
+  short_label = c("Darmanis", "Marques", "Nowakowski", "Grun", "TabulaMuris",
+                  "He-Skin", "Zhao", "ZhengSort", "MacParland"),
+  log_cells   = log10(c(466, 2993, 3005, 495, 2984, 2990, 14986, 20000, 8444)),
+  n_types     = c(9L, 13L, 48L, 9L, 30L, 21L, 30L, 10L, 8L),
+  shannon     = c(0.8795, 0.9251, 0.8283, 0.9273, 0.9371, 0.5324, 0.8881, 1.0000, 0.7129),
+  knn_purity  = c(0.7468, 0.5323, 0.1073, 0.1761, 0.7870, 0.9274, 0.7165, 0.6743, 0.9597)
+)
+
+# Tool Category Lookup Vectors (marker-based only)
+marker_tools <- c(
+  "clustifyr_hyper",
+  "clustifyr_jaccard",
+  "scCATCH",
+  "SCINA",
+  "ScInfeR",
+  "SCSA",
+  "scSorter",
+  "scType"
+)
+
+# Shared Theme Component
+theme_bench <- function(base_size = 8) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text               = element_text(family = "Helvetica"),
+      plot.title         = element_text(face = "bold", size = base_size + 1,
+                                        colour = "grey10", margin = margin(b = 4)),
+      plot.subtitle      = element_text(colour = "grey40", size = base_size - 1,
+                                        margin = margin(b = 6)),
+      strip.text         = element_text(face = "bold", size = base_size - 1,
+                                        margin = margin(3, 3, 3, 3)),
+      strip.background   = element_rect(fill = "grey92", colour = NA),
+      panel.border       = element_rect(colour = "grey20", fill = NA, linewidth = 0.4),
+      panel.background   = element_rect(fill = "white", colour = NA),
+      plot.background    = element_rect(fill = "white", colour = NA),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(colour = "grey88", linewidth = 0.3),
+      axis.line          = element_blank(),
+      axis.title         = element_text(size = base_size),
+      axis.text          = element_text(colour = "grey30", size = base_size - 1),
+      legend.position    = "bottom",
+      legend.title       = element_text(face = "bold", size = base_size - 1),
+      legend.text        = element_text(size = base_size - 1),
+      legend.key.size    = unit(3, "mm"),
+      plot.caption       = element_text(hjust = 0, size = base_size - 1,
+                                        colour = "grey30",
+                                        margin = margin(t = 8),
+                                        lineheight = 1.1),
+      plot.margin        = margin(6, 8, 16, 8)
+    )
+}
+
+kappa_axis   <- scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1))
+kappa_axis_x <- scale_x_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1))
+
+
+# ============================================================
+# 3. HELPER FUNCTIONS
+# ============================================================
+
+# Returns a named vector mapping each marker tool to "Marker-Based".
+.build_category_map <- function() {
+  setNames(rep("Marker-Based", length(marker_tools)), marker_tools)
+}
+
+# Drops the unnamed integer row-index column that Python/pandas sometimes writes as column 1.
+.drop_index_col <- function(df) {
+  index_names <- c("", "X", "Unnamed: 0")
+  if (ncol(df) > 0 && colnames(df)[1] %in% index_names) {
+    df <- df[, -1, drop = FALSE]
+  }
+  df
+}
+
+# Joins human-readable scenario labels and coerces tool_category to an ordered factor.
+add_labels <- function(d) {
+  d %>%
+    mutate(
+      scenario_label = factor(recode(scenario, !!!SCENARIO_LABELS), levels = unname(SCENARIO_LABELS)),
+      tool_category  = factor(tool_category, levels = names(CATEGORY_COLOURS))
+    )
+}
+
+# Computes the Nemenyi critical difference (CD) for k tools over N blocks at significance alpha.
+compute_cd <- function(k, N, alpha = 0.05) {
+  q_alpha <- qtukey(1 - alpha, k, Inf) / sqrt(2)
+  cd      <- q_alpha * sqrt(k * (k + 1) / (6 * N))
+  cd
+}
+
+# Groups tools into cliques of non-significantly-different pairs based on mean rank and CD threshold.
+build_cd_cliques <- function(mean_ranks_df, CD) {
+  tools_ordered <- mean_ranks_df$tool
+  ranks_ordered <- mean_ranks_df$mean_rank
+  n <- length(tools_ordered)
+  cliques <- list()
+
+  i <- 1
+  while (i <= n) {
+    j <- i
+    while (j < n && (ranks_ordered[j + 1] - ranks_ordered[i]) < CD) {
+      j <- j + 1
+    }
+    if (j > i) {
+      cliques[[length(cliques) + 1]] <- list(
+        start = ranks_ordered[i], end = ranks_ordered[j],
+        from  = tools_ordered[i], to  = tools_ordered[j]
+      )
+      i <- j + 1
+    } else {
+      i <- i + 1
+    }
+  }
+  cliques
+}
+
+# Scatter of mean Cohen's kappa vs a dataset characteristic, pooled across all tools, with Spearman subtitle.
+make_scatter_effect <- function(data, x_col, xlabel, line_col) {
+  plot_df <- data %>%
+    group_by(scenario) %>%
+    summarise(
+      mean_kappa  = mean(kappa_mean, na.rm = TRUE),
+      x_val       = mean(.data[[x_col]], na.rm = TRUE),
+      short_label = unique(short_label)[[1]],
+      .groups     = "drop"
+    )
+  
+  sp  <- cor.test(plot_df$x_val, plot_df$mean_kappa, method = "spearman", exact = FALSE)
+  pe  <- cor.test(plot_df$x_val, plot_df$mean_kappa, method = "pearson")
+  
+  sig_sp <- dplyr::case_when(sp$p.value < 0.001 ~ "***", sp$p.value < 0.01 ~ "**", sp$p.value < 0.05 ~ "*", TRUE ~ "ns")
+  sig_pe <- dplyr::case_when(pe$p.value < 0.001 ~ "***", pe$p.value < 0.01 ~ "**", pe$p.value < 0.05 ~ "*", TRUE ~ "ns")
+  
+  fit <- lm(mean_kappa ~ x_val, data = plot_df)
+  cf <- coef(fit)
+  intercept <- cf[1]
+  slope <- cf[2]
+  r_squared <- summary(fit)$r.squared
+  sign_slope <- ifelse(slope < 0, "-", "+")
+  eq_label <- sprintf("y = %.3f %s %.3fx  (R\u00b2 = %.2f)", intercept, sign_slope, abs(slope), r_squared)
+  
+  sub_label <- sprintf("Spearman \u03c1 = %.2f (p = %.3f %s)  |  Pearson r = %.2f (p = %.3f %s)\nFit: %s",
+                       sp$estimate, sp$p.value, sig_sp, pe$estimate, pe$p.value, sig_pe, eq_label)
+  
+  ggplot(plot_df, aes(x = x_val, y = mean_kappa)) +
+    geom_smooth(method = "lm", se = TRUE, colour = line_col, fill = line_col,
+                alpha = 0.15, linewidth = 0.8) +
+    geom_point(size = 4, colour = line_col) +
+    ggrepel::geom_text_repel(aes(label = short_label), size = 2.8, colour = "grey30",
+                              segment.colour = "grey60", segment.size = 0.3, max.overlaps = 20) +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+    labs(x = xlabel, y = "Mean Cohen\u2019s \u03ba", subtitle = sub_label) +
+    theme_bench() + theme(panel.grid.major.x = element_blank())
+}
+
+# Folder-based loader, copied from P4 V1 / P5 V2 so scenario is derived from
+# the directory name rather than from filename parsing. Filenames in the
+# upstream P5 V2 run vary in subtle ways (e.g. "Marques-Brain-2016_for_use"
+# vs "Marques-Brain_for_use", "MacParland-Liver-Broad-2018_original_seurat"
+# vs "MacParland-Liver-Broad_original") that defeat a single regex. The
+# folder name is the canonical scenario identifier.
+#
+# Optional `tools_to_include` restricts the returned data to that tool set
+# (used by P6b to load only the marker-database-oracle-consuming tools and
+# the two cluster-correlation extras without dragging in the full benchmark).
+load_benchmark_results <- function(base_dir, subfolders = NULL,
+                                   tools_to_include = NULL,
+                                   exclude_tools    = NULL,
+                                   pattern = "\\.csv$",
+                                   warn_unknown = FALSE) {
+  if (!dir.exists(base_dir)) stop("base_dir does not exist: ", base_dir)
+
+  if (is.null(subfolders)) {
+    subfolders <- list.dirs(base_dir, full.names = FALSE, recursive = FALSE)
+    subfolders <- subfolders[nchar(subfolders) > 0]
+    if (length(subfolders) == 0) stop("No subdirectories found in: ", base_dir)
+  }
+
+  cat_map <- .build_category_map()
+  all_dfs <- list()
+
+  for (scenario in subfolders) {
+    scenario_path <- file.path(base_dir, scenario)
+    if (!dir.exists(scenario_path)) {
+      warning("Subfolder missing, skipping: ", scenario_path); next
+    }
+
+    rep_dirs <- list.dirs(scenario_path, full.names = FALSE, recursive = FALSE)
+    rep_dirs <- rep_dirs[nchar(rep_dirs) > 0]
+
+    # No replicate subdirectories — read CSVs directly from the scenario folder.
+    if (length(rep_dirs) == 0) {
+      csv_files <- list.files(scenario_path, pattern = pattern,
+                              full.names = TRUE, recursive = FALSE)
+      if (length(csv_files) == 0) next
+      rep_dfs <- lapply(csv_files, function(f) tryCatch({
+        df <- .drop_index_col(read.csv(f, stringsAsFactors = FALSE, check.names = FALSE))
+        df[["scenario"]]  <- scenario
+        df[["replicate"]] <- "rep1"
+        df
+      }, error = function(e) { warning("Failed to read: ", f); NULL }))
+      rep_dfs <- Filter(Negate(is.null), rep_dfs)
+      if (length(rep_dfs) > 0) all_dfs[[scenario]] <- dplyr::bind_rows(rep_dfs)
+      next
+    }
+
+    for (rep in rep_dirs) {
+      rep_path  <- file.path(scenario_path, rep)
+      csv_files <- list.files(rep_path, pattern = pattern,
+                              full.names = TRUE, recursive = FALSE)
+      if (length(csv_files) == 0) next
+
+      rep_dfs <- lapply(csv_files, function(f) tryCatch({
+        df <- .drop_index_col(read.csv(f, stringsAsFactors = FALSE, check.names = FALSE))
+        df[["scenario"]]  <- scenario
+        df[["replicate"]] <- rep
+        df
+      }, error = function(e) { warning("Failed to read: ", f); NULL }))
+      rep_dfs <- Filter(Negate(is.null), rep_dfs)
+      if (length(rep_dfs) > 0) all_dfs[[paste0(scenario, "/", rep)]] <- dplyr::bind_rows(rep_dfs)
+    }
+  }
+
+  if (length(all_dfs) == 0) stop("No data loaded. Check base_dir and subfolders.")
+  combined <- dplyr::bind_rows(all_dfs)
+  rownames(combined) <- NULL
+
+  if (!is.null(tools_to_include) && length(tools_to_include) > 0) {
+    combined <- combined[combined[["tool"]] %in% tools_to_include, , drop = FALSE]
+  }
+  if (!is.null(exclude_tools) && length(exclude_tools) > 0) {
+    combined <- combined[!combined[["tool"]] %in% exclude_tools, , drop = FALSE]
+  }
+
+  combined[["tool_category"]] <- cat_map[combined[["tool"]]]
+
+  if (warn_unknown) {
+    unknown <- unique(combined[["tool"]][is.na(combined[["tool_category"]])])
+    if (length(unknown) > 0) warning(length(unknown), " tool(s) not in any category: ",
+                                     paste(unknown, collapse = ", "))
+  }
+
+  front    <- c("scenario", "replicate", "tool", "tool_category")
+  combined <- combined[, c(front, setdiff(colnames(combined), front))]
+
+  message("Loaded ", nrow(combined), " rows | ",
+          length(unique(combined[["scenario"]])), " scenario(s) | ",
+          length(unique(combined[["tool"]])), " tool(s)")
+  combined
+}
+
+
+# ============================================================
+# 4. DATA PROCESSING
+# ============================================================
+
+# Load raw benchmark data from the canonical Phase 2 oracle real run (P5 V2),
+# filtered to the marker-database-oracle-consuming tools plus the two
+# cluster-correlation extras (CIPR, scmap_cluster). The extras land with
+# tool_category = NA and are silently excluded from the main marker pipeline
+# by the existing `!is.na(tool_category)` filters; a dedicated supplementary
+# script selects them by tool name.
+df <- load_benchmark_results(
+  base_dir         = BASE_DIR,
+  subfolders       = P6B_DATASETS,
+  tools_to_include = TOOLS_TO_INCLUDE,
+  warn_unknown     = FALSE
+)
+
+df <- df %>%
+  mutate(kappa_mean = ifelse(kappa_mean == 0 & accuracy_mean == 0 & f1_mean == 0, NA_real_, kappa_mean))
+
+# Scenario-level means (single replicate per real dataset)
+df_scenario_mean <- df %>%
+  filter(!is.na(tool_category)) %>%
+  mutate(across(where(is.logical), as.numeric)) %>%
+  group_by(scenario, tool, tool_category) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# Merge continuous dataset characteristics into dataframe
+df_profiles <- df_scenario_mean %>%
+  left_join(DATASET_PROFILES, by = "scenario") %>%
+  filter(!is.na(tool_category), !is.na(kappa_mean))
+
+
+# ============================================================
+# 5. STATISTICAL ANALYSIS
+# ============================================================
+
+# --- A1. Eta-Squared Decomposition -- Cohen's kappa (continuous dataset characteristics) ---
+# Type III (marginal-after-all-others) SS partition throughout; total SS denominator
+# is the observed total (sum of Type I SS), matching `manuscript/Notes/type3_eta_squared.py`.
+fit_eta     <- lm(kappa_mean ~ log_cells + n_types + shannon + knn_purity, data = df_profiles)
+anova_res   <- car::Anova(fit_eta, type = 3)
+ss_total    <- sum(anova(fit_eta)[["Sum Sq"]])
+ss_residual <- anova_res["Residuals", "Sum Sq"]
+
+eta_sq_df <- tibble::tibble(
+  factor       = c("log_cells", "n_types", "shannon", "knn_purity"),
+  factor_label = c("log\u2081\u2080(Cell Count)", "No. Cell Types",
+                   "Shannon Entropy (Imbalance)", "KNN Purity (Difficulty)"),
+  eta_sq  = anova_res[c("log_cells","n_types","shannon","knn_purity"), "Sum Sq"] / ss_total,
+  p_value = anova_res[c("log_cells","n_types","shannon","knn_purity"), "Pr(>F)"]
+) %>%
+  mutate(
+    sig_stars = case_when(p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+                          p_value < 0.05 ~ "*", TRUE ~ "ns")
+  ) %>%
+  arrange(desc(eta_sq))
+
+residual_prop <- ss_residual / ss_total
+
+# --- A2. Eta-Squared Decomposition for Runtime ---
+df_profiles_rt <- df_profiles %>%
+  filter(!is.na(runtime_mean), runtime_mean > 0) %>%
+  mutate(log_runtime = log10(runtime_mean))
+fit_eta_rt     <- lm(log_runtime ~ log_cells + n_types + shannon + knn_purity, data = df_profiles_rt)
+anova_res_rt   <- car::Anova(fit_eta_rt, type = 3)
+ss_total_rt    <- sum(anova(fit_eta_rt)[["Sum Sq"]])
+ss_residual_rt <- anova_res_rt["Residuals", "Sum Sq"]
+
+eta_sq_rt_df <- tibble::tibble(
+  factor       = c("log_cells", "n_types", "shannon", "knn_purity"),
+  factor_label = c("log\u2081\u2080(Cell Count)", "No. Cell Types",
+                   "Shannon Entropy (Imbalance)", "KNN Purity (Difficulty)"),
+  eta_sq  = anova_res_rt[c("log_cells","n_types","shannon","knn_purity"), "Sum Sq"] / ss_total_rt,
+  p_value = anova_res_rt[c("log_cells","n_types","shannon","knn_purity"), "Pr(>F)"]
+) %>%
+  mutate(
+    sig_stars = case_when(p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+                          p_value < 0.05 ~ "*", TRUE ~ "ns")
+  ) %>%
+  arrange(desc(eta_sq))
+
+residual_prop_rt <- ss_residual_rt / ss_total_rt
+
+# --- B. Friedman Test & Nemenyi Post-hoc ---
+kappa_wide <- df_scenario_mean %>%
+  filter(!is.na(tool_category)) %>%
+  dplyr::select(scenario, tool, kappa_mean) %>%
+  pivot_wider(names_from = tool, values_from = kappa_mean)
+
+kappa_mat_raw           <- as.matrix(kappa_wide[, -1])
+rownames(kappa_mat_raw) <- kappa_wide$scenario
+
+complete_tools <- colnames(kappa_mat_raw)[colSums(is.na(kappa_mat_raw)) == 0]
+kappa_mat      <- kappa_mat_raw[, complete_tools, drop = FALSE]
+
+friedman_res <- friedman.test(kappa_mat)
+
+rank_mat   <- t(apply(kappa_mat, 1, function(row) rank(-row, ties.method = "average")))
+mean_ranks <- colMeans(rank_mat, na.rm = TRUE)
+
+mean_ranks_df <- tibble::tibble(tool = names(mean_ranks), mean_rank = mean_ranks) %>%
+  arrange(mean_rank) %>%
+  left_join(df_scenario_mean %>% distinct(tool, tool_category), by = "tool")
+
+if (friedman_res$p.value < 0.05) {
+  nemenyi_res <- PMCMRplus::frdAllPairsNemenyiTest(y = kappa_mat, p.adjust.method = "none")
+  p_mat       <- nemenyi_res$p.value
+} else {
+  nemenyi_res <- NULL
+  p_mat       <- NULL
+}
+
+k_tools     <- length(complete_tools)
+N_scenarios <- nrow(kappa_mat)
+CD          <- compute_cd(k_tools, N_scenarios)
+cliques     <- build_cd_cliques(mean_ranks_df, CD)
+
+
+# ============================================================
+# 6. PLOT GENERATION
+# ============================================================
+
+# PLOT 1: Per-tool Cohen's kappa distributions across all real datasets.
+# Useful for spotting which tools have high variance or systematic underperformance.
+p1 <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category)) %>%
+  ggplot(aes(x = tool, y = kappa_mean, fill = tool_category, colour = tool_category)) +
+  geom_boxplot(alpha = 0.25, outlier.shape = NA, width = 0.55, coef = 1.5) +
+  geom_jitter(width = 0.18, size = 1.6, alpha = 0.7) +
+  facet_wrap(~scenario_label, ncol = 3) +
+  scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  kappa_axis +
+  labs(
+    title    = "Cohen's \u03ba by tool and real dataset (Real Validation)",
+    subtitle = "Boxplot per real dataset (9-panel facet). One point per tool (single replicate per dataset).",
+    x        = "Tool",
+    y        = "Mean Cohen's \u03ba",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+# PLOT 2: Heatmap showing mean Cohen's kappa for every (tool, dataset) combination.
+# Tools ordered by overall mean kappa; reveals which datasets are systematically hard for all tools.
+heatmap_data <- df_scenario_mean %>%
+  add_labels() %>%
+  dplyr::select(tool, tool_category, scenario_label, kappa_mean) %>%
+  group_by(tool) %>%
+  mutate(overall_kappa = mean(kappa_mean, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(tool = factor(tool, levels = rev(names(.build_category_map()))))
+
+p2 <- heatmap_data %>%
+  ggplot(aes(x = scenario_label, y = tool, fill = kappa_mean)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(is.na(kappa_mean), "", sprintf("%.2f", kappa_mean))),
+            size = 3.5, colour = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#c0392b", mid = "#f39c12", high = "#27ae60",
+    midpoint = 0.5, limits = c(0, 1),
+    breaks = c(0, 0.25, 0.5, 0.75, 1),
+    name = "Mean Cohen's \u03ba", na.value = "white",
+    guide = guide_colorbar(barwidth = unit(10, "cm"),
+                           barheight = unit(0.4, "cm"),
+                           title.position = "top",
+                           title.hjust = 0.5)
+  ) +
+  scale_y_discrete(labels = mark_cluster_dep) +
+  labs(
+    title    = "Per-tool Cohen's \u03ba across real datasets (Real Validation)",
+    subtitle = "Tools sorted alphabetically. Each cell = mean \u03ba.",
+    x        = "Dataset",
+    y        = "Tool",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(
+    axis.text.y      = element_text(size = 8),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    panel.grid.major = element_blank()
+  ) +
+  CLUSTER_DEP_THEME
+
+# PLOT 3: Performance-runtime tradeoff for marker-based tools on real datasets.
+# Ideal tools sit in the upper-left (high kappa, low runtime); bubble size shows prediction uncertainty.
+tradeoff_data <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(runtime_mean), runtime_mean > 0) %>%
+  group_by(tool, tool_category) %>%
+  summarise(
+    mean_kappa    = mean(kappa_mean,                              na.rm = TRUE),
+    mean_runtime  = mean(runtime_mean,                            na.rm = TRUE),
+    mean_kappa_ci = replace_na(mean(kappa_ci_upper - kappa_ci_lower, na.rm = TRUE), 0),
+    .groups       = "drop"
+  )
+
+p3 <- tradeoff_data %>%
+  ggplot(aes(x = mean_runtime, y = mean_kappa, colour = tool_category, size = mean_kappa_ci)) +
+  geom_point(alpha = 0.8) +
+  geom_text_repel(aes(label = mark_cluster_dep(tool)), size = 2.6, max.overlaps = 20,
+                  segment.colour = "grey60", segment.size = 0.3) +
+  scale_x_log10(labels = label_number(suffix = "s", big.mark = ",")) +
+  kappa_axis +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_size_continuous(name = "\u03ba CI width\n(uncertainty)", range = c(2, 8)) +
+  labs(
+    title    = "Performance\u2013runtime tradeoff (Real Validation)",
+    subtitle = "X-axis log\u2081\u2080 scale. Bubble size = 95% CI width of mean \u03ba (larger = less consistent).",
+    x        = "Mean runtime (seconds, log scale)",
+    y        = "Mean Cohen's \u03ba",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench()
+
+# PLOT 4: Performance-memory tradeoff for marker-based tools on real datasets.
+# Shows whether memory-hungry tools deliver better classification accuracy.
+memory_data <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(peak_system_memory_mean_mb), peak_system_memory_mean_mb > 0) %>%
+  group_by(tool, tool_category) %>%
+  summarise(
+    mean_kappa  = mean(kappa_mean,                 na.rm = TRUE),
+    mean_memory = mean(peak_system_memory_mean_mb, na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+p4 <- memory_data %>%
+  ggplot(aes(x = mean_memory, y = mean_kappa, colour = tool_category)) +
+  geom_point(size = 3.5, alpha = 0.8) +
+  geom_text_repel(aes(label = mark_cluster_dep(tool)), size = 2.6, max.overlaps = 20,
+                  segment.colour = "grey60", segment.size = 0.3) +
+  scale_x_log10(labels = label_number(suffix = " MB", big.mark = ",")) +
+  kappa_axis +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  labs(
+    title    = "Performance\u2013memory tradeoff (Real Validation)",
+    subtitle = "X-axis log\u2081\u2080 scale. Each point = one tool, averaged across all real datasets.",
+    x        = "Mean peak memory (MB, log scale)",
+    y        = "Mean Cohen's \u03ba",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench()
+
+# PLOT 5: Per-tool kappa stability -- range between best and worst real dataset.
+# A large range signals a tool that is highly sensitive to dataset characteristics.
+stability_data <- df_scenario_mean %>%
+  add_labels() %>%
+  dplyr::select(tool, tool_category, scenario_label, kappa_mean) %>%
+  pivot_wider(names_from = scenario_label, values_from = kappa_mean) %>%
+  rename_with(~ gsub("\n", " ", .x)) %>%
+  {
+    nms       <- names(.)
+    scen_cols <- nms[!nms %in% c("tool", "tool_category")]
+    mutate(.,
+      best       = do.call(pmax, c(dplyr::select(., all_of(scen_cols)), list(na.rm = TRUE))),
+      worst      = do.call(pmin, c(dplyr::select(., all_of(scen_cols)), list(na.rm = TRUE))),
+      kappa_drop = best - worst
+    )
+  } %>%
+  filter(!is.na(kappa_drop)) %>%
+  arrange(desc(kappa_drop)) %>%
+  mutate(tool = factor(tool, levels = tool))
+
+p5 <- stability_data %>%
+  ggplot(aes(x = tool, y = kappa_drop, fill = tool_category)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "\u03ba stability across real datasets (Real Validation)",
+    subtitle = "Bar height = max \u03ba \u2212 min \u03ba across datasets. Taller bars = more dataset-sensitive tools.",
+    x        = NULL,
+    y        = "\u03ba range (best \u2212 worst)",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+# PLOT 6: Macro F1 vs Cohen's kappa -- checks whether both metrics agree on tool ranking.
+# Points above the diagonal have higher F1 than kappa; those below are penalised more by kappa.
+agreement_data <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category)) %>%
+  group_by(tool, tool_category) %>%
+  summarise(
+    mean_f1    = mean(f1_mean,    na.rm = TRUE),
+    mean_kappa = mean(kappa_mean, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(divergence = abs(mean_f1 - mean_kappa))
+
+p6 <- agreement_data %>%
+  ggplot(aes(x = mean_kappa, y = mean_f1, colour = tool_category, size = divergence)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  geom_point(alpha = 0.8) +
+  geom_text_repel(aes(label = mark_cluster_dep(tool)), size = 2.6, max.overlaps = 20,
+                  segment.colour = "grey60", segment.size = 0.3) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_size_continuous(name = "F1\u2212\u03ba divergence", range = c(2, 8)) +
+  kappa_axis_x +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "Macro F1 vs Cohen's \u03ba (Real Validation)",
+    subtitle = "Dashed line = perfect agreement. Bubble size = |F1 \u2212 \u03ba| divergence.",
+    x        = "Mean Cohen's \u03ba",
+    y        = "Mean macro F1",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench()
+
+# PLOT 7: Runtime distributions across all real datasets per tool (log scale).
+# Reveals whether runtime is consistent across datasets or dataset-dependent.
+p7 <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(runtime_mean), runtime_mean > 0) %>%
+  ggplot(aes(x = tool, y = runtime_mean, fill = tool_category, colour = tool_category)) +
+  geom_boxplot(alpha = 0.25, outlier.shape = NA, width = 0.55, coef = 1.5) +
+  geom_jitter(width = 0.18, size = 1.6, alpha = 0.7) +
+  facet_wrap(~scenario_label, ncol = 3) +
+  scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  scale_y_log10(labels = label_number(suffix = "s", big.mark = ",")) +
+  labs(
+    title    = "Runtime by tool and real dataset (Real Validation)",
+    subtitle = "Y-axis log\u2081\u2080 scale. One point per dataset per tool.",
+    x        = "Tool",
+    y        = "Mean runtime (seconds, log scale)",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+# PLOT 8: Peak memory distributions across all real datasets per tool (log scale).
+# Identifies memory-intensive tools that may be impractical on lower-spec hardware.
+p8 <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(peak_system_memory_mean_mb), peak_system_memory_mean_mb > 0) %>%
+  ggplot(aes(x = tool, y = peak_system_memory_mean_mb, fill = tool_category, colour = tool_category)) +
+  geom_boxplot(alpha = 0.25, outlier.shape = NA, width = 0.55, coef = 1.5) +
+  geom_jitter(width = 0.18, size = 1.6, alpha = 0.7) +
+  facet_wrap(~scenario_label, ncol = 3) +
+  scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  scale_y_log10(labels = label_number(suffix = " MB", big.mark = ",")) +
+  labs(
+    title    = "Peak system memory by tool and real dataset (Real Validation)",
+    subtitle = "Y-axis log\u2081\u2080 scale. One point per dataset per tool.",
+    x        = "Tool",
+    y        = "Mean peak memory (MB, log scale)",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+# PLOT 10: Rare cell-type F1 scores -- a demanding sub-metric for minority populations.
+# Low scores indicate a tool fails to generalise to rare types even when overall kappa is reasonable.
+p10 <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(rare_f1_mean)) %>%
+  ggplot(aes(x = tool, y = rare_f1_mean, fill = tool_category, colour = tool_category)) +
+  geom_boxplot(alpha = 0.25, outlier.shape = NA, width = 0.55, coef = 1.5) +
+  geom_jitter(width = 0.18, size = 1.6, alpha = 0.7) +
+  facet_wrap(~scenario_label, ncol = 3) +
+  scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "Rare cell-type F1 by tool and real dataset (Real Validation)",
+    subtitle = "F1 computed only for cell types with < 5% prevalence. Low values = poor minority-type recovery.",
+    x        = "Tool",
+    y        = "Mean rare cell-type F1",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+# PLOT 11: Proportion of cells left unassigned -- high rates reduce the utility of a classifier.
+# Shown per dataset; tools that hedge heavily on difficult datasets inflate this metric.
+p11 <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(unassigned_mean)) %>%
+  ggplot(aes(x = tool, y = unassigned_mean, fill = tool_category, colour = tool_category)) +
+  geom_boxplot(alpha = 0.25, outlier.shape = NA, width = 0.55, coef = 1.5) +
+  geom_jitter(width = 0.18, size = 1.6, alpha = 0.7) +
+  facet_wrap(~scenario_label, ncol = 3) +
+  scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "Unassigned rate by tool and real dataset (Real Validation)",
+    subtitle = "Fraction of cells returned as 'unassigned'. High rates may indicate conservative thresholds.",
+    x        = "Tool",
+    y        = "Mean unassigned rate",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+
+# PLOT 12: MCC vs Cohen's kappa -- checks consistency between two agreement metrics.
+# Divergent tools (large bubble) are sensitive to class distribution; kappa and MCC should align closely.
+mcc_kappa_data <- df %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(mcc_mean)) %>%
+  group_by(tool, tool_category) %>%
+  summarise(
+    mean_kappa = mean(kappa_mean, na.rm = TRUE),
+    mean_mcc   = mean(mcc_mean,   na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  mutate(divergence = abs(mean_mcc - mean_kappa))
+
+p12 <- mcc_kappa_data %>%
+  ggplot(aes(x = mean_kappa, y = mean_mcc, colour = tool_category, size = divergence)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  geom_point(alpha = 0.8) +
+  geom_text_repel(aes(label = mark_cluster_dep(tool)), size = 2.6, max.overlaps = 20,
+                  segment.colour = "grey60", segment.size = 0.3) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_size_continuous(name = "MCC\u2212\u03ba divergence", range = c(2, 8)) +
+  scale_x_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "MCC vs Cohen's \u03ba (Real Validation)",
+    subtitle = "Dashed line = perfect agreement. Bubble size = |MCC \u2212 \u03ba| divergence.",
+    x        = "Mean Cohen's \u03ba",
+    y        = "Mean MCC",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench()
+
+# PLOT 13: Eta-squared bar chart -- what proportion of Cohen's kappa variance is explained by each dataset factor?
+# Factors are ranked by eta-squared; dashed line marks the unexplained residual.
+eta_colours <- c(
+  "log\u2081\u2080(Cell Count)"        = "#3498DB",
+  "No. Cell Types"              = "#2ECC71",
+  "Shannon Entropy (Imbalance)" = "#E74C3C",
+  "KNN Purity (Difficulty)"     = "#9B59B6"
+)
+
+p13 <- eta_sq_df %>%
+  mutate(
+    factor_label = factor(factor_label, levels = eta_sq_df$factor_label),
+    label_text   = sprintf("\u03b7\u00b2 = %.3f\n(%s)", eta_sq, sig_stars)
+  ) %>%
+  ggplot(aes(x = fct_rev(factor_label), y = eta_sq, fill = factor_label)) +
+  geom_col(width = 0.65, alpha = 0.90) +
+  geom_text(aes(label = label_text, y = eta_sq + 0.008), hjust = 0, size = 3.5, lineheight = 0.9) +
+  geom_hline(yintercept = residual_prop, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  annotate("text", x = 0.6, y = residual_prop + 0.005,
+           label = sprintf("Residual: %.1f%%", residual_prop * 100),
+           colour = "grey40", size = 3.2, hjust = 0, fontface = "italic") +
+  coord_flip(ylim = c(0, max(eta_sq_df$eta_sq) * 1.35)) +
+  scale_fill_manual(values = eta_colours, guide = "none") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "Dataset factor decomposition \u2014 Cohen\u2019s \u03ba variance (Real Validation)",
+    subtitle = "Factors derived from empirical dataset characterisation. Dashed line = residual (tool + interactions).",
+    x        = NULL,
+    y        = "\u03b7\u00b2 (proportion of total \u03ba variance)"
+  ) +
+  theme_bench() +
+  theme(panel.grid.major.y = element_blank())
+
+# PLOT 13b: Same eta-squared decomposition but for runtime variance -- which dataset factors drive runtime?
+# A high eta-squared for log10(Cell Count) would indicate runtime scales primarily with dataset size.
+p13b <- eta_sq_rt_df %>%
+  mutate(
+    factor_label = factor(factor_label, levels = eta_sq_rt_df$factor_label),
+    label_text   = sprintf("\u03b7\u00b2 = %.3f\n(%s)", eta_sq, sig_stars)
+  ) %>%
+  ggplot(aes(x = fct_rev(factor_label), y = eta_sq, fill = factor_label)) +
+  geom_col(width = 0.65, alpha = 0.90) +
+  geom_text(aes(label = label_text, y = eta_sq + 0.008), hjust = 0, size = 3.5, lineheight = 0.9) +
+  geom_hline(yintercept = residual_prop_rt, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  annotate("text", x = 0.6, y = residual_prop_rt + 0.005,
+           label = sprintf("Residual: %.1f%%", residual_prop_rt * 100),
+           colour = "grey40", size = 3.2, hjust = 0, fontface = "italic") +
+  coord_flip(ylim = c(0, max(eta_sq_rt_df$eta_sq) * 1.35)) +
+  scale_fill_manual(values = eta_colours, guide = "none") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "Dataset factor decomposition \u2014 Runtime variance (Real Validation)",
+    subtitle = "Response: log\u2081\u2080(mean runtime). Factors from empirical dataset characterisation.",
+    x        = NULL,
+    y        = "\u03b7\u00b2 (proportion of total log-runtime variance)"
+  ) +
+  theme_bench() +
+  theme(panel.grid.major.y = element_blank())
+
+# PLOT 14: Scatter plots of mean Cohen's kappa vs each dataset characteristic (pooled across all tools).
+# Each point = one real dataset; trend line +/- CI shows the marginal effect of each factor.
+sc_N <- make_scatter_effect(df_profiles, "log_cells",  "log\u2081\u2080(Cell Count)",         "#3498DB")
+sc_I <- make_scatter_effect(df_profiles, "shannon",    "Shannon Entropy (Imbalance)",   "#E74C3C")
+sc_K <- make_scatter_effect(df_profiles, "n_types",    "No. Cell Types",                "#2ECC71")
+sc_D <- make_scatter_effect(df_profiles, "knn_purity", "KNN Purity (Difficulty)",       "#9B59B6")
+
+p14 <- (sc_N | sc_I) / (sc_K | sc_D) +
+  plot_annotation(
+    title    = "Dataset characteristic scatter plots (Real Validation)",
+    subtitle = "Each point = one real dataset. Mean Cohen\u2019s \u03ba across all tools. Linear trend \u00b1 95% CI.",
+    theme    = theme_bench()
+  )
+
+# PLOT 33: Same scatter as p14 but with mean runtime as the response -- shows how runtime scales with each factor.
+# A steep positive slope for log10(Cell Count) would confirm that runtime is primarily size-driven.
+
+# Scatter of mean runtime vs a dataset characteristic, pooled across all tools.
+make_scatter_effect_rt <- function(data, x_col, xlabel, line_col) {
+  plot_df <- data %>%
+    filter(!is.na(runtime_mean), runtime_mean > 0) %>%
+    group_by(scenario) %>%
+    summarise(
+      mean_runtime = mean(runtime_mean, na.rm = TRUE),
+      x_val        = mean(.data[[x_col]], na.rm = TRUE),
+      short_label  = unique(short_label)[[1]],
+      .groups      = "drop"
+    ) %>%
+    mutate(log_rt = log10(mean_runtime))
+  
+  sp  <- cor.test(plot_df$x_val, plot_df$log_rt, method = "spearman", exact = FALSE)
+  pe  <- cor.test(plot_df$x_val, plot_df$log_rt, method = "pearson")
+  
+  sig_sp <- dplyr::case_when(sp$p.value < 0.001 ~ "***", sp$p.value < 0.01 ~ "**", sp$p.value < 0.05 ~ "*", TRUE ~ "ns")
+  sig_pe <- dplyr::case_when(pe$p.value < 0.001 ~ "***", pe$p.value < 0.01 ~ "**", pe$p.value < 0.05 ~ "*", TRUE ~ "ns")
+  
+  fit <- lm(log_rt ~ x_val, data = plot_df)
+  cf <- coef(fit)
+  intercept <- cf[1]
+  slope <- cf[2]
+  r_squared <- summary(fit)$r.squared
+  sign_slope <- ifelse(slope < 0, "-", "+")
+  eq_label <- sprintf("log\u2081\u2080(y) = %.3f %s %.3fx  (R\u00b2 = %.2f)", intercept, sign_slope, abs(slope), r_squared)
+  
+  sub_label <- sprintf("Spearman \u03c1 = %.2f (p = %.3f %s)  |  Pearson r = %.2f (p = %.3f %s)\nFit: %s",
+                       sp$estimate, sp$p.value, sig_sp, pe$estimate, pe$p.value, sig_pe, eq_label)
+  
+  ggplot(plot_df, aes(x = x_val, y = mean_runtime)) +
+    geom_smooth(method = "lm", se = TRUE, colour = line_col, fill = line_col,
+                alpha = 0.15, linewidth = 0.8) +
+    geom_point(size = 4, colour = line_col) +
+    ggrepel::geom_text_repel(aes(label = short_label), size = 2.8, colour = "grey30",
+                              segment.colour = "grey60", segment.size = 0.3, max.overlaps = 20) +
+    scale_y_log10(labels = label_number(suffix = "s", big.mark = ",")) +
+    labs(x = xlabel, y = "Mean runtime (s, log scale)", subtitle = sub_label) +
+    theme_bench() + theme(panel.grid.major.x = element_blank())
+}
+
+sc_N33 <- make_scatter_effect_rt(df_profiles, "log_cells",  "log\u2081\u2080(Cell Count)",         "#3498DB")
+sc_I33 <- make_scatter_effect_rt(df_profiles, "shannon",    "Shannon Entropy (Imbalance)",   "#E74C3C")
+sc_K33 <- make_scatter_effect_rt(df_profiles, "n_types",    "No. Cell Types",                "#2ECC71")
+sc_D33 <- make_scatter_effect_rt(df_profiles, "knn_purity", "KNN Purity (Difficulty)",       "#9B59B6")
+
+p33 <- (sc_N33 | sc_I33) / (sc_K33 | sc_D33) +
+  plot_annotation(
+    title    = "Dataset characteristics vs runtime (Real Validation)",
+    subtitle = "Each point = one real dataset. Mean runtime across all tools. Linear trend \u00b1 95% CI. Y-axis log\u2081\u2080 scale.",
+    theme    = theme_bench()
+  )
+
+# PLOT 34: Category-stratified eta-squared for runtime -- how much does each factor explain runtime within
+# the Marker-Based category? Complements p13b with a within-category breakdown.
+eta_rt_by_category <- purrr::map_dfr(names(CATEGORY_COLOURS), function(cat) {
+  d <- df_profiles %>%
+    filter(tool_category == cat, !is.na(runtime_mean), runtime_mean > 0) %>%
+    mutate(log_runtime = log10(runtime_mean))
+  if (nrow(d) < 20) return(NULL)
+  tryCatch({
+    fit    <- lm(log_runtime ~ log_cells + n_types + shannon + knn_purity, data = d)
+    anov   <- car::Anova(fit, type = 3)
+    ss_tot <- sum(anova(fit)[["Sum Sq"]])
+    .preds <- c("log_cells", "n_types", "shannon", "knn_purity")
+    tibble::tibble(
+      category = cat,
+      factor   = .preds,
+      eta_sq   = anov[.preds, "Sum Sq"] / ss_tot
+    )
+  }, error = function(e) NULL)
+}) %>%
+  mutate(factor_label = recode(factor,
+    "log_cells"  = "log\u2081\u2080(Cell Count)",
+    "n_types"    = "No. Cell Types",
+    "shannon"    = "Shannon Entropy (Imbalance)",
+    "knn_purity" = "KNN Purity (Difficulty)"
+  ))
+
+p34 <- if (!is.null(eta_rt_by_category) && nrow(eta_rt_by_category) > 0) {
+  eta_rt_by_category %>%
+    ggplot(aes(x = factor_label, y = eta_sq, fill = category)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7, alpha = 0.88) +
+    scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    labs(
+      title    = "Category-stratified factor sensitivity \u2014 Runtime (\u03b7\u00b2) (Real Validation)",
+      subtitle = "Marker-Based tools only. Higher \u03b7\u00b2 = that factor explains more runtime variance.",
+      x        = NULL,
+      y        = "\u03b7\u00b2 (within-category)"
+    ) +
+    theme_bench() +
+    theme(axis.text.x = element_text(angle = 15, hjust = 1))
+} else NULL
+
+# PLOT 35: Standardised regression coefficients for runtime -- direction and magnitude of each
+# dataset characteristic's effect on log10(runtime) within the Marker-Based category.
+coef_rt_by_category <- purrr::map_dfr(names(CATEGORY_COLOURS), function(cat) {
+  d <- df_profiles %>%
+    filter(tool_category == cat, !is.na(runtime_mean), runtime_mean > 0) %>%
+    mutate(
+      log_runtime = log10(runtime_mean),
+      across(c(log_cells, n_types, shannon, knn_purity), scale)
+    )
+  if (nrow(d) < 20) return(NULL)
+  tryCatch({
+    fit   <- lm(log_runtime ~ log_cells + n_types + shannon + knn_purity, data = d)
+    ci    <- confint(fit)
+    coefs <- summary(fit)$coefficients
+    tibble::tibble(
+      category = cat,
+      factor   = rownames(coefs)[rownames(coefs) != "(Intercept)"],
+      estimate = coefs[rownames(coefs) != "(Intercept)", "Estimate"],
+      lo       = ci[rownames(ci)       != "(Intercept)", 1],
+      hi       = ci[rownames(ci)       != "(Intercept)", 2],
+      p_value  = coefs[rownames(coefs) != "(Intercept)", "Pr(>|t|)"]
+    )
+  }, error = function(e) NULL)
+}) %>%
+  mutate(
+    factor_label = recode(factor,
+      "log_cells"  = "log\u2081\u2080(Cell Count)",
+      "n_types"    = "No. Cell Types",
+      "shannon"    = "Shannon Entropy (Imbalance)",
+      "knn_purity" = "KNN Purity (Difficulty)"
+    ),
+    sig = case_when(
+      p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+      p_value < 0.05  ~ "*",   TRUE            ~ "ns"
+    )
+  )
+
+p35 <- if (!is.null(coef_rt_by_category) && nrow(coef_rt_by_category) > 0) {
+  coef_rt_by_category %>%
+    ggplot(aes(x = estimate, y = fct_rev(factor_label), colour = category)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+    geom_linerange(aes(xmin = lo, xmax = hi),
+                   position = position_dodge(width = 0.6), linewidth = 0.8, alpha = 0.7) +
+    geom_point(position = position_dodge(width = 0.6), size = 3, alpha = 0.9) +
+    geom_text(aes(label = sig, x = hi),
+              position = position_dodge(width = 0.6), hjust = -0.3, size = 3, show.legend = FALSE) +
+    scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    labs(
+      title    = "Effect of dataset characteristics on runtime \u2014 by tool category (Real Validation)",
+      subtitle = "Standardised \u03b2 coefficients from log\u2081\u2080(runtime) ~ scaled predictors. Error bars = 95% CI.",
+      x        = "Standardised \u03b2 (log\u2081\u2080 runtime units per SD change in predictor)",
+      y        = NULL
+    ) +
+    theme_bench() +
+    theme(panel.grid.major.y = element_blank(), legend.position = "bottom")
+} else NULL
+
+# PLOT 36: Standardised regression coefficients for Cohen's kappa -- direction and magnitude of each
+# dataset characteristic's effect on kappa within the Marker-Based category.
+coef_kappa_by_category <- purrr::map_dfr(names(CATEGORY_COLOURS), function(cat) {
+  d <- df_profiles %>%
+    filter(tool_category == cat, !is.na(kappa_mean)) %>%
+    mutate(across(c(log_cells, n_types, shannon, knn_purity), scale))
+  if (nrow(d) < 20) return(NULL)
+  tryCatch({
+    fit   <- lm(kappa_mean ~ log_cells + n_types + shannon + knn_purity, data = d)
+    ci    <- confint(fit)
+    coefs <- summary(fit)$coefficients
+    tibble::tibble(
+      category = cat,
+      factor   = rownames(coefs)[rownames(coefs) != "(Intercept)"],
+      estimate = coefs[rownames(coefs) != "(Intercept)", "Estimate"],
+      lo       = ci[rownames(ci)       != "(Intercept)", 1],
+      hi       = ci[rownames(ci)       != "(Intercept)", 2],
+      p_value  = coefs[rownames(coefs) != "(Intercept)", "Pr(>|t|)"]
+    )
+  }, error = function(e) NULL)
+}) %>%
+  mutate(
+    factor_label = recode(factor,
+      "log_cells"  = "log\u2081\u2080(Cell Count)",
+      "n_types"    = "No. Cell Types",
+      "shannon"    = "Shannon Entropy (Imbalance)",
+      "knn_purity" = "KNN Purity (Difficulty)"
+    ),
+    sig = case_when(
+      p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+      p_value < 0.05  ~ "*",   TRUE            ~ "ns"
+    )
+  )
+
+p36 <- if (!is.null(coef_kappa_by_category) && nrow(coef_kappa_by_category) > 0) {
+  coef_kappa_by_category %>%
+    ggplot(aes(x = estimate, y = fct_rev(factor_label), colour = category)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+    geom_linerange(aes(xmin = lo, xmax = hi),
+                   position = position_dodge(width = 0.6), linewidth = 0.8, alpha = 0.7) +
+    geom_point(position = position_dodge(width = 0.6), size = 3, alpha = 0.9) +
+    geom_text(aes(label = sig, x = hi),
+              position = position_dodge(width = 0.6), hjust = -0.3, size = 3, show.legend = FALSE) +
+    scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    labs(
+      title    = "Effect of dataset characteristics on Cohen's \u03ba \u2014 by tool category (Real Validation)",
+      subtitle = "Standardised \u03b2 coefficients from \u03ba ~ scaled predictors. Error bars = 95% CI.",
+      x        = "Standardised \u03b2 (\u03ba units per SD change in predictor)",
+      y        = NULL
+    ) +
+    theme_bench() +
+    theme(panel.grid.major.y = element_blank(), legend.position = "bottom")
+} else NULL
+
+# PLOT 26: Same characteristic scatter as p14 but shown per tool category (Marker-Based only here).
+# Useful for comparing characteristic effects across categories in multi-category scripts.
+
+# Scatter of mean metric vs a dataset characteristic, stratified by tool category (one line per category).
+make_scatter_effect_cat <- function(data, x_col, xlabel,
+                                     metric_col = "kappa_mean",
+                                     ylabel     = "Mean Cohen\u2019s \u03ba",
+                                     log_y      = FALSE) {
+  plot_df <- data %>%
+    group_by(scenario, tool_category) %>%
+    summarise(
+      metric = mean(.data[[metric_col]], na.rm = TRUE),
+      x_val  = mean(.data[[x_col]],     na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(metric))
+  p <- ggplot(plot_df, aes(x = x_val, y = metric, colour = tool_category)) +
+    geom_smooth(aes(group = tool_category), method = "lm", se = FALSE, linewidth = 0.8) +
+    geom_point(size = 3.5) +
+    scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    labs(x = xlabel, y = ylabel) +
+    theme_bench() +
+    theme(panel.grid.major.x = element_blank())
+  if (log_y) p <- p + scale_y_log10(labels = label_number(big.mark = ","))
+  else       p <- p + scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1))
+  p
+}
+
+# Scatter of metric vs a dataset characteristic with one line per individual tool.
+make_scatter_effect_tools <- function(data, x_col, xlabel,
+                                      metric_col = "kappa_mean",
+                                      ylabel     = "Mean Cohen\u2019s \u03ba",
+                                      log_y      = FALSE) {
+  plot_df <- data %>%
+    group_by(scenario, tool, tool_category) %>%
+    summarise(
+      metric = mean(.data[[metric_col]], na.rm = TRUE),
+      x_val  = mean(.data[[x_col]],     na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(metric))
+  p <- ggplot(plot_df, aes(x = x_val, y = metric, colour = tool_category, group = tool)) +
+    geom_line(linewidth = 0.45, alpha = 0.55) +
+    geom_point(size = 2, alpha = 0.75) +
+    scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    labs(x = xlabel, y = ylabel) +
+    theme_bench() +
+    theme(panel.grid.major.x = element_blank())
+  if (log_y) p <- p + scale_y_log10(labels = label_number(big.mark = ","))
+  else       p <- p + scale_y_continuous(limits = c(NA, 1), labels = percent_format(accuracy = 1))
+  p
+}
+
+cat_order_26 <- c("Marker-Based")
+
+cat_plots_26 <- purrr::map(cat_order_26, function(cat) {
+  d     <- filter(df_profiles, tool_category == cat)
+  sc_N2 <- make_scatter_effect(d, "log_cells",  "log\u2081\u2080(Cell Count)",         "#3498DB")
+  sc_I2 <- make_scatter_effect(d, "shannon",    "Shannon Entropy (Imbalance)",   "#E74C3C")
+  sc_K2 <- make_scatter_effect(d, "n_types",    "No. Cell Types",                "#2ECC71")
+  sc_D2 <- make_scatter_effect(d, "knn_purity", "KNN Purity (Difficulty)",       "#9B59B6")
+  (sc_N2 | sc_I2) / (sc_K2 | sc_D2) +
+    plot_annotation(title = cat, theme = theme_bench())
+})
+
+p26 <- if (length(cat_plots_26) > 0) {
+  purrr::reduce(cat_plots_26, `/`) +
+    plot_annotation(
+      title    = "Dataset characteristic scatter plots \u2014 by tool category (Real Validation)",
+      subtitle = "Each point = one real dataset. Mean Cohen\u2019s \u03ba for tools in that category. Linear trend shown.",
+      theme    = theme_bench()
+    )
+} else NULL
+
+# PLOT 28: Dataset characteristics with one trend line per tool category (kappa response).
+# With a single category, equivalent to p14 but coloured by category for consistency across scripts.
+sc_N28 <- make_scatter_effect_cat(df_profiles, "log_cells",  "log\u2081\u2080(Cell Count)")
+sc_I28 <- make_scatter_effect_cat(df_profiles, "shannon",    "Shannon Entropy (Imbalance)")
+sc_K28 <- make_scatter_effect_cat(df_profiles, "n_types",    "No. Cell Types")
+sc_D28 <- make_scatter_effect_cat(df_profiles, "knn_purity", "KNN Purity (Difficulty)")
+
+p28 <- (sc_N28 | sc_I28) / (sc_K28 | sc_D28) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Dataset characteristic plots \u2014 by tool category (Real Validation)",
+    subtitle = "Mean Cohen\u2019s \u03ba per (real dataset, category). Linear trends shown.",
+    theme    = theme_bench()
+  ) &
+  theme(legend.position = "bottom")
+
+# PLOT 29: Dataset characteristics with one line per individual tool (kappa response).
+# Reveals whether individual tool trajectories diverge from the overall category trend.
+sc_N29 <- make_scatter_effect_tools(df_profiles, "log_cells",  "log\u2081\u2080(Cell Count)")
+sc_I29 <- make_scatter_effect_tools(df_profiles, "shannon",    "Shannon Entropy (Imbalance)")
+sc_K29 <- make_scatter_effect_tools(df_profiles, "n_types",    "No. Cell Types")
+sc_D29 <- make_scatter_effect_tools(df_profiles, "knn_purity", "KNN Purity (Difficulty)")
+
+p29 <- (sc_N29 | sc_I29) / (sc_K29 | sc_D29) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Individual tool characteristic response \u2014 Cohen's \u03ba (Real Validation)",
+    subtitle = "Each line = one tool, coloured by category.",
+    theme    = theme_bench()
+  ) &
+  theme(legend.position = "bottom")
+
+# PLOT 30: Dataset characteristics vs runtime -- one trend line per tool category (log10 y-axis).
+# Shows how mean runtime for the Marker-Based category scales with each dataset characteristic.
+sc_N30 <- make_scatter_effect_cat(df_profiles, "log_cells",  "log\u2081\u2080(Cell Count)",
+                                   metric_col = "runtime_mean", ylabel = "Mean runtime (s)", log_y = TRUE)
+sc_I30 <- make_scatter_effect_cat(df_profiles, "shannon",    "Shannon Entropy (Imbalance)",
+                                   metric_col = "runtime_mean", ylabel = "Mean runtime (s)", log_y = TRUE)
+sc_K30 <- make_scatter_effect_cat(df_profiles, "n_types",    "No. Cell Types",
+                                   metric_col = "runtime_mean", ylabel = "Mean runtime (s)", log_y = TRUE)
+sc_D30 <- make_scatter_effect_cat(df_profiles, "knn_purity", "KNN Purity (Difficulty)",
+                                   metric_col = "runtime_mean", ylabel = "Mean runtime (s)", log_y = TRUE)
+
+p30 <- (sc_N30 | sc_I30) / (sc_K30 | sc_D30) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Runtime characteristic response \u2014 by tool category (Real Validation)",
+    subtitle = "Mean runtime per (real dataset, category). One line per category. Y-axis log\u2081\u2080 scale.",
+    theme    = theme_bench()
+  ) &
+  theme(legend.position = "bottom")
+
+# PLOT 27: Per-dataset Nemenyi CD diagrams -- one panel per real dataset (single replicate).
+# Note: with only one block (replicate) per dataset, the Friedman test cannot be run; these panels
+# show the tool ranking but the CD bars may not be statistically meaningful.
+make_scenario_cd <- function(scenario_id) {
+  d <- df %>%
+    filter(scenario == scenario_id, !is.na(tool_category), !is.na(kappa_mean)) %>%
+    dplyr::select(replicate, tool, kappa_mean)
+
+  mat_wide <- d %>% pivot_wider(names_from = tool, values_from = kappa_mean)
+  mat      <- as.matrix(mat_wide[, -1])
+  rownames(mat) <- mat_wide$replicate
+
+  complete_s <- colnames(mat)[colSums(is.na(mat)) == 0]
+  mat        <- mat[, complete_s, drop = FALSE]
+
+  k_s <- ncol(mat)
+  N_s <- nrow(mat)
+  if (k_s < 2 || N_s < 2) return(NULL)
+
+  fr_res       <- friedman.test(mat)
+  rank_mat_s   <- t(apply(mat, 1, function(row) rank(-row, ties.method = "average")))
+  mean_ranks_s <- colMeans(rank_mat_s)
+
+  mr_df <- tibble::tibble(tool = names(mean_ranks_s), mean_rank = mean_ranks_s) %>%
+    arrange(mean_rank) %>%
+    left_join(df_scenario_mean %>% distinct(tool, tool_category), by = "tool")
+
+  CD_s      <- compute_cd(k_s, N_s)
+  cliques_s <- build_cd_cliques(mr_df, CD_s)
+
+  clique_segs_s <- purrr::map_dfr(seq_along(cliques_s), function(idx) {
+    tibble::tibble(xmin = cliques_s[[idx]]$start, xmax = cliques_s[[idx]]$end,
+                   y    = -0.05 - (idx %% 3) * 0.06)
+  })
+
+  p_val    <- fr_res$p.value
+  fr_label <- if (p_val < 0.001) "Friedman p < 0.001 ***" else
+              if (p_val < 0.01)  sprintf("Friedman p = %.3f **",  p_val) else
+              if (p_val < 0.05)  sprintf("Friedman p = %.3f *",   p_val) else
+                                 sprintf("Friedman p = %.3f (ns)", p_val)
+
+  ggplot(mr_df, aes(x = mean_rank, y = 0)) +
+    annotate("segment", x = 1, xend = 1 + CD_s, y = 0.25, yend = 0.25,
+             colour = "black", linewidth = 1.5, lineend = "round") +
+    annotate("text", x = 1 + CD_s / 2, y = 0.29,
+             label = sprintf("CD = %.2f", CD_s), size = 2.8, fontface = "bold", vjust = 0) +
+    { if (nrow(clique_segs_s) > 0)
+        geom_segment(data = clique_segs_s,
+                     aes(x = xmin, xend = xmax, y = y, yend = y),
+                     colour = "black", linewidth = 2.5, lineend = "round", inherit.aes = FALSE)
+      else list() } +
+    geom_point(aes(colour = tool_category), size = 3, alpha = 0.9) +
+    geom_text_repel(aes(label = mark_cluster_dep(tool), colour = tool_category),
+                    nudge_y = 0.14, direction = "x",
+                    segment.size = 0.3, segment.colour = "grey60",
+                    size = 2.2, max.overlaps = 40) +
+    scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    scale_x_continuous(name   = "Mean rank (1 = best)",
+                       breaks = seq(1, k_s, by = max(1, round(k_s / 10)))) +
+    coord_cartesian(ylim = c(-0.28, 0.42)) +
+    labs(title = SCENARIO_LABELS[scenario_id], subtitle = fr_label, y = NULL,
+         caption = CLUSTER_DEP_CAPTION) +
+    theme_bench() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+          panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+}
+
+cd_plots_27 <- purrr::compact(purrr::map(names(SCENARIO_LABELS), make_scenario_cd))
+
+p27 <- if (length(cd_plots_27) > 0) {
+  purrr::reduce(cd_plots_27, `/`) +
+    plot_annotation(
+      title    = "Per-dataset Nemenyi post-hoc \u2014 critical difference diagrams (Real Validation)",
+      subtitle = "One panel per real dataset. Tools joined by thick bars are not significantly different (\u03b1 = 0.05).",
+      theme    = theme_bench()
+    )
+} else NULL
+
+# PLOT 15: Overall Nemenyi critical difference diagram -- global tool ranking with significance bars.
+# Tools connected by a thick bar cannot be distinguished statistically at alpha = 0.05.
+clique_segs <- purrr::map_dfr(seq_along(cliques), function(idx) {
+  tibble::tibble(
+    xmin = cliques[[idx]]$start, xmax = cliques[[idx]]$end,
+    y    = -0.05 - (idx %% 3) * 0.06
+  )
+})
+
+p15 <- mean_ranks_df %>%
+  mutate(y_pos = 0, col = CATEGORY_COLOURS[tool_category]) %>%
+  ggplot(aes(x = mean_rank, y = y_pos)) +
+  annotate("segment", x = 1, xend = 1 + CD, y = 0.25, yend = 0.25,
+           colour = "black", linewidth = 1.5, lineend = "round") +
+  annotate("text", x = 1 + CD / 2, y = 0.29,
+           label = sprintf("CD = %.2f", CD), size = 3.2, fontface = "bold", vjust = 0) +
+  { if (nrow(clique_segs) > 0)
+      geom_segment(data = clique_segs,
+                   aes(x = xmin, xend = xmax, y = y, yend = y),
+                   colour = "black", linewidth = 2.5, lineend = "round", inherit.aes = FALSE)
+    else list() } +
+  geom_point(aes(colour = tool_category), size = 3.5, alpha = 0.9) +
+  geom_text_repel(
+    data        = mean_ranks_df,
+    aes(x = mean_rank, y = 0, label = mark_cluster_dep(tool), colour = tool_category),
+    nudge_y     = 0.14, direction = "x",
+    segment.size = 0.3, segment.colour = "grey60",
+    size = 2.5, max.overlaps = 40, inherit.aes = FALSE
+  ) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_continuous(name   = "Mean rank (1 = best)",
+                     breaks = seq(1, k_tools, by = max(1, round(k_tools / 10)))) +
+  coord_cartesian(ylim = c(-0.28, 0.42)) +
+  labs(
+    title    = "Critical difference diagram \u2014 Nemenyi post-hoc (Real Validation)",
+    subtitle = sprintf("Tools joined by a bar are not significantly different (Nemenyi, \u03b1 = 0.05; CD = %.2f, k = %d, N = %d datasets).", CD, k_tools, N_scenarios),
+    y        = NULL,
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+
+# PLOT 16: Rank heatmap -- each cell shows a tool's within-dataset rank (1 = best).
+# Reveals consistently top-ranked tools and those whose rank varies by dataset.
+rank_heatmap_df <- as.data.frame(rank_mat) %>%
+  tibble::rownames_to_column("scenario") %>%
+  pivot_longer(-scenario, names_to = "tool", values_to = "rank") %>%
+  left_join(df_scenario_mean %>% distinct(tool, tool_category), by = "tool") %>%
+  left_join(mean_ranks_df %>% dplyr::select(tool, mean_rank), by = "tool") %>%
+  mutate(
+    tool           = factor(tool, levels = rev(names(.build_category_map()))),
+    scenario_label = recode(scenario, !!!SCENARIO_LABELS)
+  )
+
+p16 <- rank_heatmap_df %>%
+  filter(!is.na(tool_category)) %>%
+  ggplot(aes(x = scenario_label, y = tool, fill = rank)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(rank)), size = 3.5, colour = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#27ae60", mid = "#f39c12", high = "#c0392b",
+    midpoint = k_tools / 2, name = "Rank (1 = best)"
+  ) +
+  scale_y_discrete(labels = mark_cluster_dep) +
+  labs(
+    title    = "Tool rank within each real dataset (Real Validation)",
+    subtitle = "Rank 1 = highest \u03ba on that dataset. Tools sorted by mean rank across all datasets.",
+    x        = "Dataset",
+    y        = "Tool",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.y      = element_text(size = 8),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        panel.grid.major = element_blank())
+
+# PLOT 17: Real datasets ranked by overall difficulty (mean kappa across all tools).
+# Error bars show inter-tool variability; inset labels show dataset profile statistics.
+scenario_difficulty <- df_scenario_mean %>%
+  filter(!is.na(kappa_mean)) %>%
+  group_by(scenario) %>%
+  summarise(
+    mean_kappa = mean(kappa_mean, na.rm = TRUE),
+    sd_kappa   = sd(kappa_mean,   na.rm = TRUE),
+    n_tools    = sum(!is.na(kappa_mean)),
+    .groups    = "drop"
+  ) %>%
+  left_join(DATASET_PROFILES, by = "scenario") %>%
+  arrange(desc(mean_kappa)) %>%
+  mutate(
+    difficulty_rank = row_number(),
+    scenario_label  = recode(scenario, !!!SCENARIO_LABELS),
+    profile_label   = sprintf("N=%d | H=%.2f | K=%d | KNN=%.2f",
+                               round(10^log_cells), shannon, n_types, knn_purity)
+  )
+
+p17 <- scenario_difficulty %>%
+  mutate(scenario_label = factor(scenario_label, levels = scenario_label)) %>%
+  ggplot(aes(x = scenario_label, y = mean_kappa, fill = knn_purity)) +
+  geom_col(width = 0.7, alpha = 0.88) +
+  geom_errorbar(aes(ymin = mean_kappa - sd_kappa, ymax = mean_kappa + sd_kappa),
+                width = 0.25, linewidth = 0.6, colour = "grey30") +
+  geom_text(aes(label = profile_label, y = 0.02),
+            hjust = 0, size = 2.6, colour = "white", fontface = "italic") +
+  coord_flip() +
+  scale_fill_gradient(low = "#c0392b", high = "#27ae60", name = "KNN Purity\n(higher = easier)") +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title    = "Empirical real dataset difficulty ranking (Real Validation)",
+    subtitle = "Sorted by mean \u03ba across all tools. Error bars = \u00b1 1 SD. Inset: N = cells, H = Shannon entropy, K = cell types.",
+    x        = NULL,
+    y        = "Mean Cohen's \u03ba (across all tools)"
+  ) +
+  theme_bench()
+
+# PLOT 18: KNN purity (classification difficulty) vs tool performance -- does harder = lower kappa?
+# Points are (dataset, category) means; trend line confirms or refutes the relationship.
+# Prepare the aggregated data for the plot
+p18_data <- df_profiles %>%
+  filter(!is.na(tool_category), !is.na(kappa_mean)) %>%
+  group_by(scenario, tool_category) %>%
+  summarise(
+    mean_kappa = mean(kappa_mean,  na.rm = TRUE),
+    knn_purity = mean(knn_purity,  na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+# Calculate statistics (Spearman, Equation, R-squared) for EACH tool category
+p18_stats <- p18_data %>%
+  group_by(tool_category) %>%
+  summarise(
+    rho  = cor.test(knn_purity, mean_kappa, method = "spearman", exact = FALSE)$estimate,
+    pval = cor.test(knn_purity, mean_kappa, method = "spearman", exact = FALSE)$p.value,
+    m    = coef(lm(mean_kappa ~ knn_purity))[2],
+    b    = coef(lm(mean_kappa ~ knn_purity))[1],
+    r2   = summary(lm(mean_kappa ~ knn_purity))$r.squared,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sign_str = ifelse(b < 0, "-", "+"),
+    stat_label = sprintf("[%s] \u03c1 = %.2f (p = %.3f)  |  Fit: y = %.3fx %s %.3f  (R\u00b2 = %.2f)",
+                         tool_category, rho, pval, m, sign_str, abs(b), r2)
+  )
+
+# Stack the equations nicely into a multi-line subtitle
+p18_subtitle <- paste0(
+  "KNN Purity = fraction of k-nearest neighbours sharing same label (higher = easier)\n",
+  paste(p18_stats$stat_label, collapse = "\n")
+)
+
+# Generate the plot
+p18 <- p18_data %>%
+  ggplot(aes(x = knn_purity, y = mean_kappa, colour = tool_category)) +
+  geom_smooth(aes(group = tool_category), method = "lm", se = FALSE, linewidth = 0.9) +
+  geom_point(size = 3.5) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title    = "Classification difficulty vs. category performance (Real Validation)",
+    subtitle = p18_subtitle,
+    x        = "KNN Purity",
+    y        = "Mean Cohen\u2019s \u03ba"
+  ) +
+  theme_bench()
+
+# PLOT 19: Spearman correlation matrix between all performance metrics -- are kappa, F1, MCC redundant?
+# Off-diagonal rho values close to 1 indicate interchangeable metrics; low values = independent signal.
+metric_corr_data <- df_scenario_mean %>%
+  filter(!is.na(tool_category)) %>%
+  group_by(tool) %>%
+  summarise(
+    kappa      = mean(kappa_mean,      na.rm = TRUE),
+    f1         = mean(f1_mean,         na.rm = TRUE),
+    mcc        = mean(mcc_mean,        na.rm = TRUE),
+    rare_f1    = mean(rare_f1_mean,    na.rm = TRUE),
+    unassigned = mean(unassigned_mean, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  filter(rowSums(!is.na(dplyr::select(., -tool))) >= 2)
+
+corr_mat <- cor(metric_corr_data %>% dplyr::select(-tool),
+                use = "pairwise.complete.obs", method = "spearman")
+
+corr_long <- as.data.frame(corr_mat) %>%
+  tibble::rownames_to_column("metric1") %>%
+  pivot_longer(-metric1, names_to = "metric2", values_to = "rho") %>%
+  mutate(
+    metric1 = recode(metric1, "kappa" = "Cohen's \u03ba", "f1" = "Macro F1", "mcc" = "MCC",
+                     "rare_f1" = "Rare type F1", "unassigned" = "Unassigned %"),
+    metric2 = recode(metric2, "kappa" = "Cohen's \u03ba", "f1" = "Macro F1", "mcc" = "MCC",
+                     "rare_f1" = "Rare type F1", "unassigned" = "Unassigned %")
+  )
+
+p19 <- corr_long %>%
+  ggplot(aes(x = metric1, y = metric2, fill = rho)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("\u03c1 = %.2f", rho)), size = 3.2, fontface = "bold",
+            colour = ifelse(abs(corr_long$rho) > 0.6, "white", "grey20")) +
+  scale_fill_gradient2(low = "#c0392b", mid = "white", high = "#2980B9",
+                       midpoint = 0, limits = c(-1, 1), name = "Spearman \u03c1") +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "Metric correlation matrix (Real Validation)",
+    subtitle = "Spearman \u03c1 between per-tool mean metrics across all datasets. Computed pairwise over available data.",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 0), panel.grid = element_blank())
+
+# PLOT 20: Ridge plots showing the distribution of kappa values per dataset -- how spread out are tools?
+# Narrow ridges = most tools agree; wide ridges = high inter-tool variance on that dataset.
+p20 <- df_scenario_mean %>%
+  add_labels() %>%
+  filter(!is.na(tool_category), !is.na(kappa_mean)) %>%
+  left_join(scenario_difficulty %>% dplyr::select(scenario, difficulty_rank), by = "scenario") %>%
+  mutate(scenario_label = factor(
+    scenario_label,
+    levels = scenario_difficulty$scenario_label[order(scenario_difficulty$difficulty_rank)]
+  )) %>%
+  ggplot(aes(x = kappa_mean, y = fct_rev(scenario_label), fill = tool_category, colour = tool_category)) +
+  geom_density_ridges(alpha = 0.4, scale = 0.9, bandwidth = 0.06, rel_min_height = 0.02) +
+  facet_wrap(~tool_category, ncol = 2) +
+  scale_fill_manual(values = CATEGORY_COLOURS, guide = "none") +
+  scale_colour_manual(values = CATEGORY_COLOURS, guide = "none") +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(-0.1, 1.1)) +
+  labs(
+    title    = "Distribution of Cohen's \u03ba by real dataset and category (Real Validation)",
+    subtitle = "Datasets ordered by difficulty (easiest at top). Wider ridges = higher inter-tool variance.",
+    x        = "Mean Cohen's \u03ba",
+    y        = NULL
+  ) +
+  theme_bench()
+
+# PLOT 21: Top 3 tools per dataset -- which tools consistently dominate across real datasets?
+# Larger point = rank 1 on that dataset. Vertical line marks the kappa = 0.8 'excellent' threshold.
+best_tool_per_scenario <- df_scenario_mean %>%
+  filter(!is.na(kappa_mean), !is.na(tool_category)) %>%
+  group_by(scenario) %>%
+  arrange(desc(kappa_mean)) %>%
+  mutate(rank_in_scenario = row_number()) %>%
+  filter(rank_in_scenario <= 3) %>%
+  ungroup() %>%
+  mutate(scenario_label = recode(scenario, !!!SCENARIO_LABELS))
+
+p21 <- best_tool_per_scenario %>%
+  ggplot(aes(x = kappa_mean, y = fct_rev(factor(scenario_label)),
+             colour = tool_category, size = rank_in_scenario == 1)) +
+  geom_vline(xintercept = 0.8, linetype = "dashed", colour = "grey60", linewidth = 0.5) +
+  geom_point(alpha = 0.85) +
+  geom_text_repel(aes(label = mark_cluster_dep(tool)), size = 2.8, max.overlaps = 20,
+                  segment.colour = "grey60", segment.size = 0.3) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_size_manual(values = c(`TRUE` = 5.5, `FALSE` = 3), guide = "none") +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title    = "Top 3 tools per real dataset (Real Validation)",
+    subtitle = "Large point = rank 1. Dashed line = \u03ba = 0.80 ('excellent' threshold).",
+    x        = "Mean Cohen's \u03ba",
+    y        = NULL,
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench()
+
+# PLOT 22: Performance cliff -- range of kappa (best minus worst dataset) per tool.
+# Segment spans the min-max kappa range; triangle = best, inverted triangle = worst, filled circle = mean.
+cliff_data <- df_scenario_mean %>%
+  filter(!is.na(kappa_mean), !is.na(tool_category)) %>%
+  group_by(tool, tool_category) %>%
+  summarise(
+    best_kappa  = max(kappa_mean,  na.rm = TRUE),
+    worst_kappa = min(kappa_mean,  na.rm = TRUE),
+    mean_kappa  = mean(kappa_mean, na.rm = TRUE),
+    kappa_drop  = best_kappa - worst_kappa,
+    .groups     = "drop"
+  ) %>%
+  filter(!is.na(kappa_drop)) %>%
+  arrange(desc(kappa_drop)) %>%
+  mutate(tool = factor(tool, levels = tool))
+
+p22 <- cliff_data %>%
+  ggplot(aes(x = tool)) +
+  geom_linerange(aes(ymin = worst_kappa, ymax = best_kappa, colour = tool_category),
+                 linewidth = 1.2, alpha = 0.8) +
+  geom_point(aes(y = best_kappa,  colour = tool_category), shape = 24, size = 2.5, fill = "white") +
+  geom_point(aes(y = worst_kappa, colour = tool_category), shape = 25, size = 2.5, fill = "white") +
+  geom_point(aes(y = mean_kappa,  colour = tool_category), shape = 16, size = 2.0, alpha = 0.6) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_x_discrete(labels = mark_cluster_dep) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title    = "Performance cliff \u2014 \u03ba range per tool (Real Validation)",
+    subtitle = "\u25b2 = best dataset, \u25bc = worst dataset, \u25cf = mean. Sorted by range (tallest = most variable).",
+    x        = NULL,
+    y        = "Cohen's \u03ba range",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+# PLOT 23: Nemenyi p-value matrix -- pairwise statistical significance of tool differences.
+# Dark red = highly significant; grey = not significant. Tools ranked best-to-worst on both axes.
+if (!is.null(p_mat)) {
+  pmat_long <- as.data.frame(p_mat) %>%
+    tibble::rownames_to_column("tool_a") %>%
+    pivot_longer(-tool_a, names_to = "tool_b", values_to = "pval") %>%
+    filter(!is.na(pval)) %>%
+    mutate(
+      pval_cat = case_when(
+        pval < 0.001 ~ "p < 0.001", pval < 0.01 ~ "p < 0.01",
+        pval < 0.05  ~ "p < 0.05",  TRUE         ~ "ns"
+      ),
+      pval_cat = factor(pval_cat, levels = c("p < 0.001", "p < 0.01", "p < 0.05", "ns"))
+    )
+  p23 <- pmat_long %>%
+    mutate(
+      tool_a = factor(tool_a, levels = mean_ranks_df$tool),
+      tool_b = factor(tool_b, levels = rev(mean_ranks_df$tool))
+    ) %>%
+    ggplot(aes(x = tool_a, y = tool_b, fill = pval_cat)) +
+    geom_tile(colour = "white", linewidth = 0.2) +
+    geom_text(aes(label = sprintf("%.3f", pval)), size = 3) +
+    scale_fill_manual(
+      values = c("p < 0.001" = "#c0392b", "p < 0.01" = "#e67e22",
+                 "p < 0.05"  = "#f1c40f", "ns"        = "#ecf0f1"),
+      name = "Nemenyi\np-value"
+    ) +
+    scale_x_discrete(labels = mark_cluster_dep) +
+    scale_y_discrete(labels = mark_cluster_dep) +
+    labs(
+      title    = "Nemenyi post-hoc p-value matrix (Real Validation)",
+      subtitle = "Upper triangle. Dark red = highly significant difference. Both axes sorted by mean rank.",
+      x        = "Tool A",
+      y        = "Tool B",
+      caption  = CLUSTER_DEP_CAPTION
+    ) +
+    theme_bench() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+          axis.text.y = element_text(size = 8), panel.grid = element_blank())
+} else {
+  p23 <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "Friedman test not significant\nNemenyi post-hoc not applicable",
+             size = 6, colour = "grey40") +
+    theme_void()
+}
+
+# PLOT 24: Characteristic x category sensitivity (eta-squared) -- for marker-based tools, which dataset
+# factors explain the most within-category variance in Cohen's kappa?
+eta_by_category <- purrr::map_dfr(names(CATEGORY_COLOURS), function(cat) {
+  d <- df_profiles %>% filter(tool_category == cat, !is.na(kappa_mean))
+  if (nrow(d) < 20) return(NULL)
+  tryCatch({
+    fit  <- lm(kappa_mean ~ log_cells + n_types + shannon + knn_purity, data = d)
+    anov <- car::Anova(fit, type = 3)
+    .preds <- c("log_cells", "n_types", "shannon", "knn_purity")
+    tibble::tibble(
+      category = cat,
+      factor   = .preds,
+      eta_sq   = anov[.preds, "Sum Sq"] / sum(anova(fit)[["Sum Sq"]])
+    )
+  }, error = function(e) NULL)
+}) %>%
+  mutate(factor_label = recode(factor,
+    "log_cells"  = "log\u2081\u2080(Cell Count)",
+    "n_types"    = "No. Cell Types",
+    "shannon"    = "Shannon Entropy (Imbalance)",
+    "knn_purity" = "KNN Purity (Difficulty)"
+  ))
+
+p24 <- if (!is.null(eta_by_category) && nrow(eta_by_category) > 0) {
+  eta_by_category %>%
+    ggplot(aes(x = factor_label, y = eta_sq, fill = category)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7, alpha = 0.88) +
+    scale_fill_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    labs(
+      title    = "Category-stratified factor sensitivity (\u03b7\u00b2) (Real Validation)",
+      subtitle = "Marker-Based tools only. Higher \u03b7\u00b2 = that factor explains more \u03ba variance within the category.",
+      x        = NULL,
+      y        = "\u03b7\u00b2 (within-category)"
+    ) +
+    theme_bench() +
+    theme(axis.text.x = element_text(angle = 15, hjust = 1))
+} else NULL
+
+# PLOT 25: Parallel coordinates of top tools across multiple metrics -- a holistic tool profile.
+# Higher values are always better; speed is 1 - normalised runtime; coverage is 1 - unassigned rate.
+top_tools <- head(mean_ranks_df$tool, 15)
+
+parallel_data <- df_scenario_mean %>%
+  filter(tool %in% top_tools, !is.na(tool_category)) %>%
+  group_by(tool, tool_category) %>%
+  summarise(
+    kappa     = mean(kappa_mean,     na.rm = TRUE),
+    f1        = mean(f1_mean,        na.rm = TRUE),
+    mcc       = mean(mcc_mean,       na.rm = TRUE),
+    rare_f1   = mean(rare_f1_mean,   na.rm = TRUE),
+    neg_unass = 1 - mean(unassigned_mean, na.rm = TRUE),
+    neg_rt    = 1 - mean(runtime_mean,    na.rm = TRUE) / max(df_scenario_mean$runtime_mean, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  pivot_longer(cols = c(kappa, f1, mcc, rare_f1, neg_unass, neg_rt),
+               names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric = recode(metric,
+      "kappa"     = "Cohen's \u03ba", "f1"       = "Macro F1",  "mcc"     = "MCC",
+      "rare_f1"   = "Rare F1",        "neg_unass" = "Coverage\n(1 \u2212 unassigned)",
+      "neg_rt"    = "Speed\n(normalised)"
+    ),
+    metric = factor(metric, levels = c(
+      "Cohen's \u03ba", "Macro F1", "MCC", "Rare F1",
+      "Coverage\n(1 \u2212 unassigned)", "Speed\n(normalised)"
+    ))
+  ) %>%
+  group_by(metric) %>%
+  mutate(value_scaled = (value - min(value, na.rm = TRUE)) /
+                        (max(value, na.rm = TRUE) - min(value, na.rm = TRUE))) %>%
+  ungroup()
+
+p25 <- parallel_data %>%
+  ggplot(aes(x = metric, y = value_scaled, group = tool, colour = tool_category)) +
+  geom_line(alpha = 0.75, linewidth = 0.9) +
+  geom_point(size = 2.2, alpha = 0.85) +
+  geom_text_repel(
+    data    = parallel_data %>% filter(metric == "Cohen's \u03ba"),
+    aes(label = mark_cluster_dep(tool)), nudge_x = -0.35, direction = "y",
+    size = 2.4, segment.size = 0.25, segment.colour = "grey60", max.overlaps = 20
+  ) +
+  scale_colour_manual(values = CATEGORY_COLOURS, name = "Tool Category") +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     name   = "Min-max scaled score (higher = better)") +
+  scale_x_discrete(name = NULL) +
+  labs(
+    title    = sprintf("Multi-metric profile \u2014 top %d tools by mean rank (Real Validation)", length(top_tools)),
+    subtitle = "All metrics min-max scaled per axis. Higher is always better. Speed = 1 \u2212 normalised runtime.",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(panel.grid.major.x = element_line(colour = "grey85", linewidth = 0.8))
+
+# PLOT 31 helper: KNN Purity panel per category with both Spearman and Pearson significance stars.
+make_scatter_knn_sig <- function(data, x_col, xlabel, line_col) {
+  plot_df <- data %>%
+    group_by(scenario) %>%
+    summarise(
+      mean_kappa  = mean(kappa_mean, na.rm = TRUE),
+      x_val       = mean(.data[[x_col]], na.rm = TRUE),
+      short_label = unique(short_label)[[1]],
+      .groups     = "drop"
+    )
+  sp     <- cor.test(plot_df$x_val, plot_df$mean_kappa, method = "spearman", exact = FALSE)
+  pe     <- cor.test(plot_df$x_val, plot_df$mean_kappa, method = "pearson")
+  sig_sp <- dplyr::case_when(
+    sp$p.value < 0.001 ~ "***", sp$p.value < 0.01 ~ "**",
+    sp$p.value < 0.05  ~ "*",   TRUE               ~ "ns"
+  )
+  sig_pe <- dplyr::case_when(
+    pe$p.value < 0.001 ~ "***", pe$p.value < 0.01 ~ "**",
+    pe$p.value < 0.05  ~ "*",   TRUE               ~ "ns"
+  )
+  ggplot(plot_df, aes(x = x_val, y = mean_kappa)) +
+    geom_smooth(method = "lm", se = TRUE, colour = line_col, fill = line_col,
+                alpha = 0.15, linewidth = 0.8) +
+    geom_point(size = 4, colour = line_col) +
+    ggrepel::geom_text_repel(aes(label = short_label), size = 2.8, colour = "grey30",
+                              segment.colour = "grey60", segment.size = 0.3, max.overlaps = 20) +
+    scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+    labs(x = xlabel, y = "Mean Cohen\u2019s \u03ba",
+         subtitle = sprintf(
+           "Spearman \u03c1 = %.2f (p = %.3f %s)  |  Pearson r = %.2f (p = %.3f %s)",
+           sp$estimate, sp$p.value, sig_sp, pe$estimate, pe$p.value, sig_pe
+         )) +
+    theme_bench() + theme(panel.grid.major.x = element_blank())
+}
+
+# PLOT 31: KNN Purity vs mean kappa -- one panel per tool category. Confirms whether harder real
+# datasets (lower KNN purity) consistently produce lower kappa for Marker-Based tools.
+cat_order_31 <- c("Marker-Based")
+
+cat_knn_plots_31 <- purrr::map(cat_order_31, function(cat) {
+  d   <- filter(df_profiles, tool_category == cat)
+  col <- CATEGORY_COLOURS[[cat]]
+  make_scatter_knn_sig(d, "knn_purity", "KNN Purity (Difficulty)", col) +
+    labs(title = cat) +
+    theme(plot.title = element_text(size = 11, face = "bold",
+                                    colour = CATEGORY_COLOURS[[cat]]))
+})
+
+p31 <- patchwork::wrap_plots(cat_knn_plots_31, ncol = 3) +
+  plot_annotation(
+    title    = "KNN Purity vs Mean Cohen\u2019s \u03ba \u2014 by tool category (Real Validation)",
+    subtitle = "Each point = one real dataset. Mean Cohen\u2019s \u03ba for tools in that category. Spearman \u03c1 + significance shown.",
+    theme    = theme_bench()
+  )
+
+# PLOT 32: Residual correlations -- what predicts performance beyond KNN Purity?
+# For each category: fit lm(mean_kappa ~ knn_purity), then Spearman-correlate residuals with remaining chars.
+resid_base_32 <- df_profiles %>%
+  group_by(scenario, tool_category) %>%
+  summarise(
+    mean_kappa = mean(kappa_mean,  na.rm = TRUE),
+    knn_purity = mean(knn_purity,  na.rm = TRUE),
+    n_types    = mean(n_types,     na.rm = TRUE),
+    log_cells  = mean(log_cells,   na.rm = TRUE),
+    shannon    = mean(shannon,     na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+resid_corr_32 <- purrr::map_dfr(cat_order_31, function(cat) {
+  d       <- filter(resid_base_32, tool_category == cat)
+  if (nrow(d) < 4) return(NULL)
+  mod     <- lm(mean_kappa ~ knn_purity, data = d)
+  d$resid <- residuals(mod)
+  chars   <- c("n_types"   = "No. Cell Types (K)",
+                "log_cells" = "log\u2081\u2080 Cell Count (N)",
+                "shannon"   = "Shannon Entropy")
+  purrr::map_dfr(names(chars), function(col) {
+    ct  <- cor.test(d$resid, d[[col]], method = "spearman", exact = FALSE)
+    sig <- dplyr::case_when(
+      ct$p.value < 0.001 ~ "***", ct$p.value < 0.01 ~ "**",
+      ct$p.value < 0.05  ~ "*",   TRUE               ~ "ns"
+    )
+    tibble::tibble(tool_category  = cat, characteristic = chars[[col]],
+                   rho = as.numeric(ct$estimate), pval = ct$p.value,
+                   label = sprintf("%.2f%s", as.numeric(ct$estimate), sig))
+  })
+}) %>%
+  mutate(
+    tool_category  = factor(tool_category,  levels = rev(cat_order_31)),
+    characteristic = factor(characteristic, levels = c("No. Cell Types (K)",
+                                                        "log\u2081\u2080 Cell Count (N)",
+                                                        "Shannon Entropy"))
+  )
+
+p32 <- ggplot(resid_corr_32, aes(x = characteristic, y = tool_category, fill = rho)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = label), size = 3.8, colour = "grey10") +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC",
+                       midpoint = 0, limits = c(-1, 1), name = "Spearman \u03c1") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(
+    title    = "Residual correlations after regressing out KNN Purity (Real Validation)",
+    subtitle = "Spearman \u03c1 between lm(mean \u03ba ~ KNN Purity) residuals and remaining dataset characteristics.\nStars: * p<0.05, ** p<0.01, *** p<0.001",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_bench() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        panel.grid = element_blank(), legend.position = "right")
+
+
+# ============================================================
+# 6b. SUPPLEMENTARY HEATMAP -- cluster-oracle correlation extras (2-tool panel)
+# ============================================================
+# CIPR and scmap_cluster are cluster-dependent correlation-based tools that
+# are excluded from the Phase 1-3 algorithm-level comparison (see Methods).
+# They are loaded under their oracle R+C profile and reported here only, as a
+# standalone 2-tool cluster-oracle reference panel that documents their
+# behaviour under the same C oracle that the cluster-consuming marker tools
+# receive. They land with tool_category = NA from the main category map, so
+# the !is.na(tool_category) filter in the main pipeline drops them; this block
+# selects them by name from `df`.
+
+CLUSTER_CORR_EXTRAS <- c("CIPR", "scmap_cluster")
+
+df_scenario_mean_extras <- df %>%
+  filter(tool %in% CLUSTER_CORR_EXTRAS) %>%
+  mutate(across(where(is.logical), as.numeric)) %>%
+  group_by(scenario, tool) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+heatmap_extras_data <- df_scenario_mean_extras %>%
+  mutate(scenario_label = recode(scenario, !!!SCENARIO_LABELS)) %>%
+  mutate(tool = factor(tool, levels = rev(CLUSTER_CORR_EXTRAS)))
+
+p2_cluster_extras <- heatmap_extras_data %>%
+  ggplot(aes(x = scenario_label, y = tool, fill = kappa_mean)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = ifelse(is.na(kappa_mean), "", sprintf("%.2f", kappa_mean))),
+            size = 4, colour = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#c0392b", mid = "#f39c12", high = "#27ae60",
+    midpoint = 0.5, limits = c(0, 1),
+    breaks = c(0, 0.25, 0.5, 0.75, 1),
+    name = "Mean Cohen's κ", na.value = "white",
+    guide = guide_colorbar(barwidth = unit(10, "cm"),
+                           barheight = unit(0.4, "cm"),
+                           title.position = "top",
+                           title.hjust = 0.5)
+  ) +
+  scale_y_discrete(labels = mark_cluster_dep) +
+  labs(
+    title    = "Cluster-oracle correlation extras (CIPR, scmap_cluster) -- Real Validation",
+    subtitle = "R+C oracle profile. Per-(tool, dataset) mean κ on the 9 real validation datasets.",
+    x        = "Dataset",
+    y        = "Tool",
+    caption  = CLUSTER_DEP_CAPTION
+  ) +
+  theme_bench() +
+  theme(
+    axis.text.y      = element_text(size = 9),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    panel.grid.major = element_blank()
+  ) +
+  CLUSTER_DEP_THEME
+
+
+# ============================================================
+# 7. SAVE OUTPUTS
+# ============================================================
+
+message("\nGenerating and saving plots to: ", PLOT_DIR)
+
+# Render in RStudio
+# invisible(lapply(
+#   Filter(Negate(is.null), list(
+#     p1, p2, p3, p4, p5, p6, p7, p8, p10, p11, p12,
+#     p13, p13b, p14, p15, p16, p17, p18, p19, p20, p21, p22, p23,
+#     p24, p25, p26, p27, p28, p29, p30, p31, p32, p33, p34, p35, p36
+#   )),
+#   plot
+# ))
+
+# Save plots
+ggsave("plot1_tool_kappa_overview.png",          p1,  width = 330, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot2_tool_heatmap_kappa.png",           p2,  width = 254, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot2b_cluster_extras_heatmap_kappa.png", p2_cluster_extras, width = 254, height = 102, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot3_kappa_runtime_tradeoff.png",       p3,  width = 279, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot4_kappa_memory_tradeoff.png",        p4,  width = 279, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot5_kappa_stability.png",              p5,  width = 356, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot6_f1_vs_kappa_agreement.png",        p6,  width = 254, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot7_runtime_by_tool.png",              p7,  width = 330, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot8_memory_by_tool.png",               p8,  width = 330, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot10_rare_f1_by_tool.png",             p10, width = 330, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot11_unassigned_rate_by_tool.png",     p11, width = 330, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot12_mcc_vs_kappa.png",                p12, width = 254, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot13_eta_squared_factors.png",         p13, width = 254, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot13b_eta_squared_runtime.png",        p13b,width = 254, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot14_main_effects.png",                p14, width = 305, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot27_per_dataset_cd_diagrams.png",    p27, width = 356, height = 1143, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot15_critical_difference_diagram.png", p15, width = 356, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot16_rank_heatmap.png",                p16, width = 254, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot17_scenario_difficulty.png",         p17, width = 254, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot18_category_de_interaction.png",     p18, width = 254, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot19_metric_correlation.png",          p19, width = 203, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot20_kappa_ridges.png",                p20, width = 305, height = 229, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot21_best_tool_per_scenario.png",      p21, width = 279, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot22_performance_cliff.png",           p22, width = 356, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot23_nemenyi_pvalue_matrix.png",       p23, width = 356, height = 305, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot24_category_factor_sensitivity.png", p24, width = 305, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot25_parallel_coordinates.png",        p25, width = 330, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot26_main_effects_by_category.png",    p26, width = 356, height = 711, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot28_main_effects_category_overlay.png", p28, width = 305, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot29_main_effects_individual_tools.png", p29, width = 305, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot30_runtime_by_category.png",           p30, width = 305, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot31_knn_purity_by_category.png",        p31, width = 381, height = 254, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot32_residual_correlations.png",         p32, width = 203, height = 127, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot33_runtime_vs_characteristics.png",    p33, width = 305, height = 203, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot34_runtime_factor_sensitivity_by_category.png", p34, width = 305, height = 152, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot35_runtime_standardised_coefs_by_category.png", p35, width = 305, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+ggsave("plot36_kappa_standardised_coefs_by_category.png",   p36, width = 305, height = 178, units = "mm", dpi = 600, path = PLOT_DIR)
+
+
+# ============================================================
+# 8. STATISTICAL SUMMARY OUTPUT
+# ============================================================
+
+message("\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550")
+message("  STATISTICAL SUMMARY")
+message("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550")
+message(sprintf("\n  Friedman test: \u03c7\u00b2(%d) = %.3f, p = %.4f  [\u03b1 = 0.05]",
+                friedman_res$parameter, friedman_res$statistic, friedman_res$p.value))
+message(sprintf("  Critical difference (Nemenyi, k=%d, N=%d): CD = %.3f",
+                k_tools, N_scenarios, CD))
+
+message("\n  Factor importance (\u03b7\u00b2 decomposition):")
+invisible(purrr::pwalk(
+  eta_sq_df %>% dplyr::select(factor_label, eta_sq, p_value, sig_stars),
+  function(factor_label, eta_sq, p_value, sig_stars) {
+    message(sprintf("    %-25s  \u03b7\u00b2 = %.3f  (p = %.4f) %s",
+                    factor_label, eta_sq, p_value, sig_stars))
+  }
+))
+message(sprintf("    %-25s  \u03b7\u00b2 = %.3f  (residual)", "Tool + interactions", residual_prop))
+
+message("\n  Top 10 tools by mean Friedman rank:")
+invisible(purrr::pwalk(
+  head(mean_ranks_df, 10),
+  function(tool, mean_rank, tool_category, ...) {
+    message(sprintf("[%.1f]  %-30s  (%s)", mean_rank, tool, tool_category))
+  }
+))
+message("\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n")
